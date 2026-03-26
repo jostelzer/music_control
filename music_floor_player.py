@@ -10,7 +10,12 @@ import sys
 import time
 from pathlib import Path
 
-DEFAULT_MUSIC_PROMPT = "ambient synths"
+from music_floor_prompt_banks import (
+    DEFAULT_PROMPT_BANK,
+    format_prompt_bank_listing,
+    resolve_prompt_rows,
+)
+
 DEFAULT_MAGENTA_SERVER_URL = "http://graciosa:8013"
 DEFAULT_DECODE_WINDOW = 2
 DEFAULT_CROSSFADE_FRAMES = 1
@@ -59,10 +64,32 @@ def parse_args() -> argparse.Namespace:
         description="Headless Magenta player for Music Floor."
     )
     parser.add_argument(
+        "--prompt-bank",
+        type=str,
+        default=DEFAULT_PROMPT_BANK,
+        help="Built-in six-row prompt bank for startup style prompts.",
+    )
+    parser.add_argument(
+        "--row-prompt",
+        action="append",
+        default=[],
+        help="Override a row prompt. Repeat up to six times; overrides rows from the top.",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        type=str,
+        help="Optional text or JSON file defining exactly six prompt rows.",
+    )
+    parser.add_argument(
+        "--list-prompt-banks",
+        action="store_true",
+        help="Print the built-in prompt banks and exit.",
+    )
+    parser.add_argument(
         "--music-prompt",
         type=str,
-        default=DEFAULT_MUSIC_PROMPT,
-        help="Text prompt used to seed the initial six style tokens.",
+        default=None,
+        help="Legacy alias for overriding row 1 only.",
     )
     parser.add_argument(
         "--magenta-server-url",
@@ -140,6 +167,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.list_prompt_banks:
+        print(format_prompt_bank_listing())
+        return
+
     module = _load_magenta_client_module()
     client = module.RealtimeClient(
         args.magenta_server_url,
@@ -148,7 +179,13 @@ def main() -> None:
     )
     atexit.register(client.stop_session)
 
-    prompt = (args.music_prompt or "").strip() or DEFAULT_MUSIC_PROMPT
+    prompt_bank_name, prompt_rows = resolve_prompt_rows(
+        prompt_bank=args.prompt_bank,
+        prompt_file=args.prompt_file,
+        row_prompts=args.row_prompt,
+        legacy_music_prompt=args.music_prompt,
+    )
+    prompt = prompt_rows[0].prompt
     tokens = list(client.update_style(prompt))
     generation_kwargs = module._build_generation_kwargs(
         client,
@@ -172,6 +209,7 @@ def main() -> None:
     )
 
     print(f"server={client.server_url}", flush=True)
+    print(f"prompt_bank={prompt_bank_name}", flush=True)
     print(f"prompt={prompt}", flush=True)
     print(f"style_tokens={tokens}", flush=True)
     if args.status_interval > 0:

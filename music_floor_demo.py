@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -15,6 +14,13 @@ from typing import Dict, Iterable, List, Tuple
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
+
+from music_floor_prompt_banks import (
+    DEFAULT_PROMPT_BANK,
+    PromptRow,
+    format_prompt_bank_listing,
+    resolve_prompt_rows,
+)
 
 
 def _prepend_path(path: Path, package_name: str) -> bool:
@@ -70,6 +76,7 @@ _ensure_projection_mapping_on_path()
 
 # Keep projector rendering on SDL display, but never let Pygame compete for the
 # system audio device. Magenta playback already owns audio via sounddevice.
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import pygame
@@ -88,7 +95,6 @@ STYLE_ROW_INDEX = 0
 DEFAULT_ROW_INDEX = STYLE_ROW_INDEX
 STYLE_TOKEN_MIN = 0
 STYLE_TOKEN_MAX = 1023
-DEFAULT_MUSIC_PROMPT = "ambient synths"
 DEFAULT_MAGENTA_SERVER_URL = "http://graciosa:8013"
 
 BLACK = (0, 0, 0)
@@ -134,8 +140,16 @@ class GridState:
             [0 for _ in range(GRID_ROWS)] for _ in range(GRID_COLUMNS)
         ]
     )
-    prompt_style_tokens: List[int] = field(
-        default_factory=lambda: [0 for _ in range(GRID_COLUMNS)]
+    row_labels: List[str] = field(
+        default_factory=lambda: [f"Row {index + 1}" for index in range(GRID_ROWS)]
+    )
+    row_prompts: List[str] = field(
+        default_factory=lambda: ["" for _ in range(GRID_ROWS)]
+    )
+    row_style_tokens: List[List[int]] = field(
+        default_factory=lambda: [
+            [0 for _ in range(GRID_COLUMNS)] for _ in range(GRID_ROWS)
+        ]
     )
     current_style_tokens: List[int] = field(
         default_factory=lambda: [0 for _ in range(GRID_COLUMNS)]
@@ -147,7 +161,7 @@ class GridState:
     frame_index: int | None = None
     timestamp_iso: str | None = None
     pose_status: str = "static rows"
-    prompt_text: str = DEFAULT_MUSIC_PROMPT
+    prompt_bank_name: str = DEFAULT_PROMPT_BANK
     magenta_server_url: str = DEFAULT_MAGENTA_SERVER_URL
     magenta_status: str = "magenta idle"
 
@@ -199,12 +213,21 @@ class MagentaController:
     def __init__(
         self,
         server_url: str,
-        prompt: str,
+        prompt_rows: List[PromptRow],
     ) -> None:
-        self.prompt = (prompt or "").strip() or DEFAULT_MUSIC_PROMPT
+        if len(prompt_rows) != GRID_ROWS:
+            raise ValueError(
+                f"Expected {GRID_ROWS} prompt rows, got {len(prompt_rows)}."
+            )
+        self.prompt_rows = [
+            PromptRow(label=row.label.strip(), prompt=row.prompt.strip())
+            for row in prompt_rows
+        ]
         self.server_url = self._normalize_server_url(server_url)
-        self.prompt_style_tokens: List[int] = self._tokenize_style_text(self.prompt)
-        self.current_style_tokens: List[int] = list(self.prompt_style_tokens)
+        self.row_style_tokens: List[List[int]] = [
+            self._tokenize_style_text(row.prompt) for row in self.prompt_rows
+        ]
+        self.current_style_tokens: List[int] = list(self.row_style_tokens[DEFAULT_ROW_INDEX])
         self._latest_status = "server control idle"
         self._apply_control(self.current_style_tokens)
 
@@ -367,10 +390,32 @@ def parse_args() -> argparse.Namespace:
         help="Optional initial wait time for a pose frame before rendering.",
     )
     parser.add_argument(
+        "--prompt-bank",
+        type=str,
+        default=DEFAULT_PROMPT_BANK,
+        help="Built-in six-row prompt bank for the floor grid.",
+    )
+    parser.add_argument(
+        "--row-prompt",
+        action="append",
+        default=[],
+        help="Override a row prompt. Repeat up to six times; overrides rows from the top.",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        type=str,
+        help="Optional text or JSON file defining exactly six prompt rows.",
+    )
+    parser.add_argument(
+        "--list-prompt-banks",
+        action="store_true",
+        help="Print the built-in prompt banks and exit.",
+    )
+    parser.add_argument(
         "--music-prompt",
         type=str,
-        default=DEFAULT_MUSIC_PROMPT,
-        help="Text prompt sent to Magenta to seed the top-row style tokens.",
+        default=None,
+        help="Legacy alias for overriding row 1 only.",
     )
     parser.add_argument(
         "--magenta-server-url",
@@ -382,7 +427,7 @@ def parse_args() -> argparse.Namespace:
         "--random-seed",
         type=int,
         default=None,
-        help="Optional seed for the random non-prompt token layout.",
+        help="Deprecated; prompt banks no longer use random token rows.",
     )
     parser.add_argument(
         "--debug-person",
@@ -443,37 +488,22 @@ def _row_label(row_index: int) -> str:
 
 
 def _build_token_columns(
-    prompt_style_tokens: List[int],
-    *,
-    seed: int | None,
+    row_style_tokens: List[List[int]],
 ) -> List[List[int]]:
-    if len(prompt_style_tokens) != GRID_COLUMNS:
+    if len(row_style_tokens) != GRID_ROWS:
         raise SystemExit(
-            f"Expected {GRID_COLUMNS} prompt style tokens, got {len(prompt_style_tokens)}."
+            f"Expected {GRID_ROWS} prompt rows, got {len(row_style_tokens)}."
         )
 
     columns = [[0 for _ in range(GRID_ROWS)] for _ in range(GRID_COLUMNS)]
-    used_tokens = {int(token) for token in prompt_style_tokens}
-    pool = [
-        token
-        for token in range(STYLE_TOKEN_MIN, STYLE_TOKEN_MAX + 1)
-        if token not in used_tokens
-    ]
-    rng = random.Random(seed)
-    rng.shuffle(pool)
-
-    pool_index = 0
-    for column_index, token in enumerate(prompt_style_tokens):
-        columns[column_index][STYLE_ROW_INDEX] = int(token)
-
-    for row_index in range(GRID_ROWS):
-        if row_index == STYLE_ROW_INDEX:
-            continue
-        for column_index in range(GRID_COLUMNS):
-            if pool_index >= len(pool):
-                raise SystemExit("Ran out of unique random style tokens.")
-            columns[column_index][row_index] = pool[pool_index]
-            pool_index += 1
+    for row_index, row_tokens in enumerate(row_style_tokens):
+        if len(row_tokens) != GRID_COLUMNS:
+            raise SystemExit(
+                f"Prompt row {row_index + 1} must have {GRID_COLUMNS} style tokens, "
+                f"got {len(row_tokens)}."
+            )
+        for column_index, token in enumerate(row_tokens):
+            columns[column_index][row_index] = int(token)
 
     return columns
 
@@ -661,6 +691,13 @@ def _render_text(
     surface.blit(rendered, (x, y))
 
 
+def _truncate_text(text: str, max_chars: int) -> str:
+    cleaned = " ".join((text or "").split())
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return f"{cleaned[: max(0, max_chars - 1)].rstrip()}…"
+
+
 def create_floor_frame(size: Size, state: GridState) -> pygame.Surface:
     surface = pygame.Surface(size)
     surface.fill(BLACK)
@@ -745,6 +782,7 @@ def create_front_frame(size: Size, state: GridState) -> pygame.Surface:
 
     title_font = _font(max(28, height // 12))
     subtitle_font = _font(max(18, height // 24))
+    row_font = _font(max(14, height // 36))
     panel_title_font = _font(max(18, height // 22))
     panel_value_font = _font(max(22, height // 15))
     panel_status_font = _font(max(14, height // 30))
@@ -754,7 +792,7 @@ def create_front_frame(size: Size, state: GridState) -> pygame.Surface:
     _render_text(surface, "Music Floor", title_font, TEXT_MAIN, left_pad, top_pad)
     _render_text(
         surface,
-        "Top row = prompt tokens. Lower rows = unique random tokens. Each column posts one Magenta style slot to the server.",
+        "Each row is a full six-token prompt. Matching all columns to one row recreates that prompt exactly.",
         subtitle_font,
         TEXT_MUTED,
         left_pad,
@@ -776,7 +814,7 @@ def create_front_frame(size: Size, state: GridState) -> pygame.Surface:
     )
     _render_text(
         surface,
-        f"Prompt: {state.prompt_text}",
+        f"Prompt bank: {state.prompt_bank_name}",
         subtitle_font,
         TEXT_MUTED,
         left_pad,
@@ -799,12 +837,39 @@ def create_front_frame(size: Size, state: GridState) -> pygame.Surface:
         top_pad + title_font.get_height() + subtitle_font.get_height() * 4 + 62,
     )
 
+    legend_top = top_pad + title_font.get_height() + subtitle_font.get_height() * 5 + 82
+    legend_col_gap = int(round(width * 0.03))
+    legend_col_width = int(round((width - left_pad * 2 - legend_col_gap) / 2))
+    legend_row_height = row_font.get_height() * 2 + 16
+    for row_index in range(GRID_ROWS):
+        col_index = row_index // 3
+        row_in_col = row_index % 3
+        any_selected = any(selected == row_index for selected in state.selected_rows)
+        text_color = FLOOR_SELECTED_BORDER if any_selected else TEXT_MAIN
+        detail_color = FLOOR_ACTIVE_BORDER if any_selected else TEXT_MUTED
+        legend_x = left_pad + col_index * (legend_col_width + legend_col_gap)
+        legend_y = legend_top + row_in_col * legend_row_height
+        title_text = f"R{row_index + 1}  {state.row_labels[row_index]}"
+        prompt_text = _truncate_text(state.row_prompts[row_index], 56)
+        _render_text(surface, title_text, row_font, text_color, legend_x, legend_y)
+        _render_text(
+            surface,
+            prompt_text,
+            row_font,
+            detail_color,
+            legend_x,
+            legend_y + row_font.get_height() + 2,
+        )
+
     panel_gap = int(round(width * 0.018))
     panel_width = int(
         round((width - left_pad * 2 - panel_gap * (GRID_COLUMNS - 1)) / GRID_COLUMNS)
     )
-    panel_height = int(round(height * 0.34))
-    panel_y = int(round(height * 0.52))
+    panel_y = legend_top + legend_row_height * 3 + int(round(height * 0.05))
+    panel_height = max(
+        int(round(height * 0.22)),
+        height - panel_y - int(round(height * 0.14)),
+    )
 
     for column_index in range(GRID_COLUMNS):
         panel_x = left_pad + column_index * (panel_width + panel_gap)
@@ -824,12 +889,13 @@ def create_front_frame(size: Size, state: GridState) -> pygame.Surface:
             True,
             FLOOR_SELECTED_BORDER if is_active else TEXT_ACCENT,
         )
+        selected_row = state.selected_rows[column_index]
         status_text = (
-            f"{_row_label(state.selected_rows[column_index])} {'active' if is_active else 'locked'}"
+            f"{_row_label(selected_row)} {'active' if is_active else 'locked'}"
         )
         status_surface = panel_status_font.render(status_text, True, TEXT_MUTED)
         prompt_surface = panel_status_font.render(
-            f"prompt {state.prompt_style_tokens[column_index]}",
+            state.row_labels[selected_row],
             True,
             TEXT_MUTED,
         )
@@ -900,8 +966,10 @@ def save_previews(
         "grid": {"columns": GRID_COLUMNS, "rows": GRID_ROWS},
         "selected_rows": [row + 1 for row in state.selected_rows],
         "grid_tokens": state.grid_tokens,
-        "prompt_text": state.prompt_text,
-        "prompt_style_tokens": state.prompt_style_tokens,
+        "prompt_bank_name": state.prompt_bank_name,
+        "row_labels": state.row_labels,
+        "row_prompts": state.row_prompts,
+        "row_style_tokens": state.row_style_tokens,
         "current_style_tokens": state.current_style_tokens,
         "magenta_server_url": state.magenta_server_url,
         "magenta_status": state.magenta_status,
@@ -929,6 +997,7 @@ def save_previews(
 
 def _connect_magenta_controller(
     args: argparse.Namespace,
+    prompt_rows: List[PromptRow],
     *,
     start_playback: bool,
 ) -> MagentaController:
@@ -936,7 +1005,7 @@ def _connect_magenta_controller(
     try:
         return MagentaController(
             server_url=args.magenta_server_url,
-            prompt=args.music_prompt,
+            prompt_rows=prompt_rows,
         )
     except Exception as exc:
         raise SystemExit(f"Could not start Magenta control: {exc}") from exc
@@ -1026,6 +1095,16 @@ def _visual_state_signature(state: GridState) -> Tuple[object, ...]:
 
 def main() -> None:
     args = parse_args()
+    if args.list_prompt_banks:
+        print(format_prompt_bank_listing())
+        return
+
+    prompt_bank_name, prompt_rows = resolve_prompt_rows(
+        prompt_bank=args.prompt_bank,
+        prompt_file=args.prompt_file,
+        row_prompts=args.row_prompt,
+        legacy_music_prompt=args.music_prompt,
+    )
 
     pygame.init()
     pygame.mixer.quit()
@@ -1043,15 +1122,19 @@ def main() -> None:
     try:
         magenta_controller = _connect_magenta_controller(
             args,
+            prompt_rows=prompt_rows,
             start_playback=not args.preview_only,
         )
-        state.prompt_text = magenta_controller.prompt
+        state.prompt_bank_name = prompt_bank_name
+        state.row_labels = [row.label for row in prompt_rows]
+        state.row_prompts = [row.prompt for row in prompt_rows]
         state.magenta_server_url = magenta_controller.server_url
-        state.prompt_style_tokens = list(magenta_controller.prompt_style_tokens)
-        state.current_style_tokens = list(magenta_controller.prompt_style_tokens)
+        state.row_style_tokens = [
+            list(tokens) for tokens in magenta_controller.row_style_tokens
+        ]
+        state.current_style_tokens = list(magenta_controller.current_style_tokens)
         state.grid_tokens = _build_token_columns(
-            state.prompt_style_tokens,
-            seed=args.random_seed,
+            state.row_style_tokens,
         )
         state.magenta_status = magenta_controller.status_text()
 
