@@ -5,11 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import random
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 
 def _prepend_path(path: Path, package_name: str) -> bool:
@@ -63,6 +68,10 @@ def _ensure_pose_stream_on_path() -> None:
 
 _ensure_projection_mapping_on_path()
 
+# Keep projector rendering on SDL display, but never let Pygame compete for the
+# system audio device. Magenta playback already owns audio via sounddevice.
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+
 import pygame
 
 from projection_mapping import CanvasProjectorRouter
@@ -75,7 +84,12 @@ WORLD_MIN = -3.5
 WORLD_MAX = 3.5
 GRID_COLUMNS = 6
 GRID_ROWS = 6
-DEFAULT_ROW_INDEX = 3
+STYLE_ROW_INDEX = 0
+DEFAULT_ROW_INDEX = STYLE_ROW_INDEX
+STYLE_TOKEN_MIN = 0
+STYLE_TOKEN_MAX = 1023
+DEFAULT_MUSIC_PROMPT = "ambient synths"
+DEFAULT_MAGENTA_SERVER_URL = "http://graciosa:8013"
 
 BLACK = (0, 0, 0)
 TEXT_MAIN = (235, 235, 235)
@@ -92,6 +106,7 @@ FLOOR_CIRCLE_BORDER = (188, 188, 188)
 FLOOR_SELECTED_FILL = (58, 196, 84)
 FLOOR_SELECTED_BORDER = (208, 255, 216)
 FLOOR_MARKER = (255, 255, 255)
+FLOOR_TOKEN_TEXT = (12, 12, 12)
 
 FRONT_PANEL = (20, 20, 20)
 FRONT_PANEL_BORDER = (80, 80, 80)
@@ -114,6 +129,17 @@ class GridState:
     selected_rows: List[int] = field(
         default_factory=lambda: [DEFAULT_ROW_INDEX for _ in range(GRID_COLUMNS)]
     )
+    grid_tokens: List[List[int]] = field(
+        default_factory=lambda: [
+            [0 for _ in range(GRID_ROWS)] for _ in range(GRID_COLUMNS)
+        ]
+    )
+    prompt_style_tokens: List[int] = field(
+        default_factory=lambda: [0 for _ in range(GRID_COLUMNS)]
+    )
+    current_style_tokens: List[int] = field(
+        default_factory=lambda: [0 for _ in range(GRID_COLUMNS)]
+    )
     active_columns: set[int] = field(default_factory=set)
     people: List[PersonFloorSample] = field(default_factory=list)
     column_drivers: Dict[int, PersonFloorSample] = field(default_factory=dict)
@@ -121,6 +147,9 @@ class GridState:
     frame_index: int | None = None
     timestamp_iso: str | None = None
     pose_status: str = "static rows"
+    prompt_text: str = DEFAULT_MUSIC_PROMPT
+    magenta_server_url: str = DEFAULT_MAGENTA_SERVER_URL
+    magenta_status: str = "magenta idle"
 
 
 class PoseStreamSource:
@@ -166,9 +195,115 @@ class PoseStreamSource:
         self._client.close()
 
 
+class MagentaController:
+    def __init__(
+        self,
+        server_url: str,
+        prompt: str,
+    ) -> None:
+        self.prompt = (prompt or "").strip() or DEFAULT_MUSIC_PROMPT
+        self.server_url = self._normalize_server_url(server_url)
+        self.prompt_style_tokens: List[int] = self._tokenize_style_text(self.prompt)
+        self.current_style_tokens: List[int] = list(self.prompt_style_tokens)
+        self._latest_status = "server control idle"
+        self._apply_control(self.current_style_tokens)
+
+    @staticmethod
+    def _normalize_server_url(server_url: str) -> str:
+        url = (server_url or "").strip().rstrip("/")
+        if not url:
+            raise ValueError("Magenta server URL is required.")
+        parsed = urllib_parse.urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("Magenta server URL must start with http:// or https://")
+        return url
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        data: bytes | None = None,
+        content_type: str | None = None,
+    ):
+        headers = {}
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        request = urllib_request.Request(
+            f"{self.server_url}{path}",
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urllib_request.urlopen(request, timeout=10) as response:
+                payload = response.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"{method} {path} failed: {exc.code} {details}") from exc
+        except urllib_error.URLError as exc:
+            raise RuntimeError(f"{method} {path} failed: {exc.reason}") from exc
+        return json.loads(payload)
+
+    def _tokenize_style_text(self, prompt: str) -> List[int]:
+        stream_info = self._request_json("GET", "/stream_info")
+        token_count = int(stream_info.get("style_token_count", GRID_COLUMNS))
+        if token_count != GRID_COLUMNS:
+            raise RuntimeError(
+                f"Magenta server expects {token_count} style tokens, "
+                f"but Music Floor uses {GRID_COLUMNS} columns."
+            )
+        payload = prompt.encode("utf-8")
+        response = self._request_json(
+            "POST",
+            "/style_tokens",
+            data=payload,
+            content_type="text/plain; charset=utf-8",
+        )
+        if not isinstance(response, list) or len(response) != GRID_COLUMNS:
+            raise RuntimeError(
+                f"Invalid /style_tokens response: expected {GRID_COLUMNS} tokens."
+            )
+        return [int(token) for token in response]
+
+    def _apply_control(self, style_tokens: List[int]) -> None:
+        response = self._request_json(
+            "POST",
+            "/control",
+            data=json.dumps({"style_tokens": [int(token) for token in style_tokens]}).encode(
+                "utf-8"
+            ),
+            content_type="application/json",
+        )
+        if isinstance(response, dict) and isinstance(response.get("style_tokens"), list):
+            self.current_style_tokens = [int(token) for token in response["style_tokens"]]
+        else:
+            self.current_style_tokens = [int(token) for token in style_tokens]
+        session_is_active = bool(response.get("session_is_active")) if isinstance(response, dict) else False
+        playback_state = str(response.get("playback_state") or "unknown") if isinstance(response, dict) else "unknown"
+        session_text = "session active" if session_is_active else "no player session"
+        self._latest_status = (
+            f"server control {session_text} | playback={playback_state.lower()} @ {self.server_url}"
+        )
+
+    def poll(self) -> None:
+        return None
+
+    def update_style_tokens(self, style_tokens: List[int]) -> List[int]:
+        tokens = [int(token) for token in style_tokens]
+        self._apply_control(tokens)
+        return list(self.current_style_tokens)
+
+    def status_text(self) -> str:
+        return self._latest_status
+
+    def close(self) -> None:
+        return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Music Floor demo with live ankle-driven grid selection."
+        description="Music Floor demo with live ankle-driven Magenta style-token selection."
     )
     parser.add_argument(
         "--config",
@@ -232,6 +367,24 @@ def parse_args() -> argparse.Namespace:
         help="Optional initial wait time for a pose frame before rendering.",
     )
     parser.add_argument(
+        "--music-prompt",
+        type=str,
+        default=DEFAULT_MUSIC_PROMPT,
+        help="Text prompt sent to Magenta to seed the top-row style tokens.",
+    )
+    parser.add_argument(
+        "--magenta-server-url",
+        type=str,
+        default=DEFAULT_MAGENTA_SERVER_URL,
+        help="URL of the Magenta realtime server.",
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        help="Optional seed for the random non-prompt token layout.",
+    )
+    parser.add_argument(
         "--debug-person",
         action="append",
         default=[],
@@ -287,6 +440,49 @@ def _row_index_from_z(z: float) -> int | None:
 
 def _row_label(row_index: int) -> str:
     return f"Row {row_index + 1}"
+
+
+def _build_token_columns(
+    prompt_style_tokens: List[int],
+    *,
+    seed: int | None,
+) -> List[List[int]]:
+    if len(prompt_style_tokens) != GRID_COLUMNS:
+        raise SystemExit(
+            f"Expected {GRID_COLUMNS} prompt style tokens, got {len(prompt_style_tokens)}."
+        )
+
+    columns = [[0 for _ in range(GRID_ROWS)] for _ in range(GRID_COLUMNS)]
+    used_tokens = {int(token) for token in prompt_style_tokens}
+    pool = [
+        token
+        for token in range(STYLE_TOKEN_MIN, STYLE_TOKEN_MAX + 1)
+        if token not in used_tokens
+    ]
+    rng = random.Random(seed)
+    rng.shuffle(pool)
+
+    pool_index = 0
+    for column_index, token in enumerate(prompt_style_tokens):
+        columns[column_index][STYLE_ROW_INDEX] = int(token)
+
+    for row_index in range(GRID_ROWS):
+        if row_index == STYLE_ROW_INDEX:
+            continue
+        for column_index in range(GRID_COLUMNS):
+            if pool_index >= len(pool):
+                raise SystemExit("Ran out of unique random style tokens.")
+            columns[column_index][row_index] = pool[pool_index]
+            pool_index += 1
+
+    return columns
+
+
+def _selected_style_tokens(state: GridState) -> List[int]:
+    return [
+        state.grid_tokens[column_index][state.selected_rows[column_index]]
+        for column_index in range(GRID_COLUMNS)
+    ]
 
 
 def _effective_canvas_sizes(config_path: str) -> Dict[str, Size]:
@@ -428,7 +624,7 @@ def _apply_samples_to_state(
     pose_status: str,
     frame_index: int | None = None,
     timestamp_iso: str | None = None,
-) -> None:
+) -> List[int]:
     state.people = list(samples)
     state.people_count = len(samples)
     state.active_columns = {sample.column_index for sample in samples}
@@ -444,9 +640,13 @@ def _apply_samples_to_state(
         if existing is None or sample.confidence > existing.confidence:
             best_by_column[sample.column_index] = sample
 
+    changed_columns: List[int] = []
     for column_index, sample in best_by_column.items():
-        state.selected_rows[column_index] = sample.row_index
+        if state.selected_rows[column_index] != sample.row_index:
+            state.selected_rows[column_index] = sample.row_index
+            changed_columns.append(column_index)
     state.column_drivers = best_by_column
+    return changed_columns
 
 
 def _render_text(
@@ -471,6 +671,7 @@ def create_floor_frame(size: Size, state: GridState) -> pygame.Surface:
     cell_w = width / GRID_COLUMNS
     cell_h = height / GRID_ROWS
     radius = max(8, int(round(min(cell_w, cell_h) * 0.24)))
+    token_font = _font(max(12, int(round(radius * 0.78))))
     lane_width = max(24, int(round(cell_w * 0.64)))
     lane_top = int(round(cell_h * 0.35))
     lane_height = max(1, height - lane_top * 2)
@@ -514,6 +715,7 @@ def create_floor_frame(size: Size, state: GridState) -> pygame.Surface:
         for row_index, z_world in enumerate(y_centers):
             center = _world_to_pixel(size, x_world, z_world)
             is_selected = row_index == selected_row
+            token = state.grid_tokens[column_index][row_index]
             fill = FLOOR_SELECTED_FILL if is_selected else FLOOR_CIRCLE_FILL
             border = FLOOR_SELECTED_BORDER if is_selected else FLOOR_CIRCLE_BORDER
             pygame.draw.circle(surface, fill, center, radius)
@@ -524,6 +726,9 @@ def create_floor_frame(size: Size, state: GridState) -> pygame.Surface:
                 radius,
                 width=max(2, int(round(radius * 0.08))),
             )
+            token_surface = token_font.render(str(token), True, FLOOR_TOKEN_TEXT)
+            token_rect = token_surface.get_rect(center=center)
+            surface.blit(token_surface, token_rect)
 
     marker_radius = max(6, int(round(min(cell_w, cell_h) * 0.08)))
     for sample in state.people:
@@ -539,17 +744,17 @@ def create_front_frame(size: Size, state: GridState) -> pygame.Surface:
     width, height = size
 
     title_font = _font(max(28, height // 12))
-    subtitle_font = _font(max(20, height // 22))
-    panel_title_font = _font(max(18, height // 20))
-    panel_value_font = _font(max(24, height // 14))
-    panel_status_font = _font(max(16, height // 28))
+    subtitle_font = _font(max(18, height // 24))
+    panel_title_font = _font(max(18, height // 22))
+    panel_value_font = _font(max(22, height // 15))
+    panel_status_font = _font(max(14, height // 30))
 
     top_pad = int(round(height * 0.07))
     left_pad = int(round(width * 0.06))
     _render_text(surface, "Music Floor", title_font, TEXT_MAIN, left_pad, top_pad)
     _render_text(
         surface,
-        "Ankle midpoint controls the nearest row. Each column keeps its last locked green row.",
+        "Top row = prompt tokens. Lower rows = unique random tokens. Each column posts one Magenta style slot to the server.",
         subtitle_font,
         TEXT_MUTED,
         left_pad,
@@ -569,13 +774,37 @@ def create_front_frame(size: Size, state: GridState) -> pygame.Surface:
         left_pad,
         top_pad + title_font.get_height() + subtitle_font.get_height() + 26,
     )
+    _render_text(
+        surface,
+        f"Prompt: {state.prompt_text}",
+        subtitle_font,
+        TEXT_MUTED,
+        left_pad,
+        top_pad + title_font.get_height() + subtitle_font.get_height() * 2 + 38,
+    )
+    _render_text(
+        surface,
+        f"Live style tokens: {state.current_style_tokens}",
+        subtitle_font,
+        TEXT_ACCENT,
+        left_pad,
+        top_pad + title_font.get_height() + subtitle_font.get_height() * 3 + 50,
+    )
+    _render_text(
+        surface,
+        state.magenta_status,
+        subtitle_font,
+        TEXT_MUTED,
+        left_pad,
+        top_pad + title_font.get_height() + subtitle_font.get_height() * 4 + 62,
+    )
 
     panel_gap = int(round(width * 0.018))
     panel_width = int(
         round((width - left_pad * 2 - panel_gap * (GRID_COLUMNS - 1)) / GRID_COLUMNS)
     )
-    panel_height = int(round(height * 0.40))
-    panel_y = int(round(height * 0.38))
+    panel_height = int(round(height * 0.34))
+    panel_y = int(round(height * 0.52))
 
     for column_index in range(GRID_COLUMNS):
         panel_x = left_pad + column_index * (panel_width + panel_gap)
@@ -587,23 +816,33 @@ def create_front_frame(size: Size, state: GridState) -> pygame.Surface:
         pygame.draw.rect(surface, panel_border, panel_rect, width=3, border_radius=18)
 
         label_surface = panel_title_font.render(
-            f"Column {column_index + 1}", True, TEXT_MAIN if is_active else TEXT_MUTED
+            f"Slot {column_index + 1}", True, TEXT_MAIN if is_active else TEXT_MUTED
         )
+        current_token = state.current_style_tokens[column_index]
         value_surface = panel_value_font.render(
-            _row_label(state.selected_rows[column_index]),
+            str(current_token),
             True,
             FLOOR_SELECTED_BORDER if is_active else TEXT_ACCENT,
         )
-        status_text = "active" if is_active else "locked"
+        status_text = (
+            f"{_row_label(state.selected_rows[column_index])} {'active' if is_active else 'locked'}"
+        )
         status_surface = panel_status_font.render(status_text, True, TEXT_MUTED)
+        prompt_surface = panel_status_font.render(
+            f"prompt {state.prompt_style_tokens[column_index]}",
+            True,
+            TEXT_MUTED,
+        )
 
         label_rect = label_surface.get_rect(center=(panel_rect.centerx, panel_rect.y + 36))
-        value_rect = value_surface.get_rect(center=(panel_rect.centerx, panel_rect.centery - 12))
-        status_rect = status_surface.get_rect(center=(panel_rect.centerx, panel_rect.centery + 42))
+        value_rect = value_surface.get_rect(center=(panel_rect.centerx, panel_rect.centery - 26))
+        status_rect = status_surface.get_rect(center=(panel_rect.centerx, panel_rect.centery + 16))
+        prompt_rect = prompt_surface.get_rect(center=(panel_rect.centerx, panel_rect.centery + 42))
 
         surface.blit(label_surface, label_rect)
         surface.blit(value_surface, value_rect)
         surface.blit(status_surface, status_rect)
+        surface.blit(prompt_surface, prompt_rect)
 
         active_sample = state.column_drivers.get(column_index)
         if active_sample is not None:
@@ -660,6 +899,12 @@ def save_previews(
         "world_bounds": {"x": [WORLD_MIN, WORLD_MAX], "z": [WORLD_MIN, WORLD_MAX]},
         "grid": {"columns": GRID_COLUMNS, "rows": GRID_ROWS},
         "selected_rows": [row + 1 for row in state.selected_rows],
+        "grid_tokens": state.grid_tokens,
+        "prompt_text": state.prompt_text,
+        "prompt_style_tokens": state.prompt_style_tokens,
+        "current_style_tokens": state.current_style_tokens,
+        "magenta_server_url": state.magenta_server_url,
+        "magenta_status": state.magenta_status,
         "active_columns": sorted(column + 1 for column in state.active_columns),
         "people": [
             {
@@ -682,6 +927,21 @@ def save_previews(
     )
 
 
+def _connect_magenta_controller(
+    args: argparse.Namespace,
+    *,
+    start_playback: bool,
+) -> MagentaController:
+    del start_playback
+    try:
+        return MagentaController(
+            server_url=args.magenta_server_url,
+            prompt=args.music_prompt,
+        )
+    except Exception as exc:
+        raise SystemExit(f"Could not start Magenta control: {exc}") from exc
+
+
 def _connect_pose_source(args: argparse.Namespace) -> PoseStreamSource | None:
     if not args.pose_endpoint:
         return None
@@ -693,11 +953,11 @@ def _connect_pose_source(args: argparse.Namespace) -> PoseStreamSource | None:
     )
 
 
-def _apply_debug_people_if_any(state: GridState, args: argparse.Namespace) -> None:
+def _apply_debug_people_if_any(state: GridState, args: argparse.Namespace) -> List[int]:
     debug_samples = _parse_debug_people(args.debug_person)
     if not debug_samples:
-        return
-    _apply_samples_to_state(
+        return []
+    return _apply_samples_to_state(
         state,
         debug_samples,
         pose_status="debug people",
@@ -706,11 +966,16 @@ def _apply_debug_people_if_any(state: GridState, args: argparse.Namespace) -> No
     )
 
 
-def _apply_pose_message_if_any(state: GridState, message, endpoint: str, port: int) -> None:
+def _apply_pose_message_if_any(
+    state: GridState,
+    message,
+    endpoint: str,
+    port: int,
+) -> List[int]:
     if message is None:
-        return
+        return []
     samples = _extract_floor_samples_from_message(message)
-    _apply_samples_to_state(
+    return _apply_samples_to_state(
         state,
         samples,
         pose_status=f"pose {endpoint}:{port}",
@@ -719,10 +984,51 @@ def _apply_pose_message_if_any(state: GridState, message, endpoint: str, port: i
     )
 
 
+def _sync_magenta_tokens(
+    state: GridState,
+    magenta_controller: MagentaController | None,
+) -> bool:
+    next_tokens = _selected_style_tokens(state)
+    if next_tokens == state.current_style_tokens:
+        return False
+    if magenta_controller is not None:
+        state.current_style_tokens = list(
+            magenta_controller.update_style_tokens(next_tokens)
+        )
+        state.magenta_status = magenta_controller.status_text()
+    else:
+        state.current_style_tokens = next_tokens
+    return True
+
+
+def _visual_state_signature(state: GridState) -> Tuple[object, ...]:
+    people_signature = tuple(
+        (
+            sample.person_id,
+            round(sample.x, 3),
+            round(sample.z, 3),
+            sample.column_index,
+            sample.row_index,
+        )
+        for sample in state.people
+    )
+    return (
+        tuple(state.selected_rows),
+        tuple(tuple(column) for column in state.grid_tokens),
+        tuple(sorted(state.active_columns)),
+        people_signature,
+        tuple(state.current_style_tokens),
+        state.magenta_status,
+        state.pose_status,
+        state.people_count,
+    )
+
+
 def main() -> None:
     args = parse_args()
 
     pygame.init()
+    pygame.mixer.quit()
     pygame.font.init()
 
     canvas_sizes = _effective_canvas_sizes(args.config)
@@ -731,20 +1037,39 @@ def main() -> None:
 
     floor_canvas = _pick_floor_canvas(canvas_sizes, args.floor_canvas)
     state = GridState()
-    _apply_debug_people_if_any(state, args)
-
+    magenta_controller = None
     pose_source = None
+
     try:
+        magenta_controller = _connect_magenta_controller(
+            args,
+            start_playback=not args.preview_only,
+        )
+        state.prompt_text = magenta_controller.prompt
+        state.magenta_server_url = magenta_controller.server_url
+        state.prompt_style_tokens = list(magenta_controller.prompt_style_tokens)
+        state.current_style_tokens = list(magenta_controller.prompt_style_tokens)
+        state.grid_tokens = _build_token_columns(
+            state.prompt_style_tokens,
+            seed=args.random_seed,
+        )
+        state.magenta_status = magenta_controller.status_text()
+
+        if _apply_debug_people_if_any(state, args):
+            _sync_magenta_tokens(state, magenta_controller)
+
         pose_source = _connect_pose_source(args)
         if pose_source is not None:
             bootstrap_message = pose_source.wait_for_latest(args.pose_bootstrap_seconds)
             if bootstrap_message is not None:
-                _apply_pose_message_if_any(
+                changed_columns = _apply_pose_message_if_any(
                     state,
                     bootstrap_message,
                     args.pose_endpoint,
                     args.pose_port,
                 )
+                if changed_columns:
+                    _sync_magenta_tokens(state, magenta_controller)
             elif state.pose_status == "static rows":
                 state.pose_status = f"pose {args.pose_endpoint}:{args.pose_port} waiting"
 
@@ -776,6 +1101,7 @@ def main() -> None:
         )
 
         clock = pygame.time.Clock()
+        last_visual_signature = None
         running = True
         while running:
             for event in pygame.event.get():
@@ -787,30 +1113,45 @@ def main() -> None:
             if pose_source is not None:
                 latest_message = pose_source.poll_latest()
                 if latest_message is not None:
-                    _apply_pose_message_if_any(
+                    changed_columns = _apply_pose_message_if_any(
                         state,
                         latest_message,
                         args.pose_endpoint,
                         args.pose_port,
                     )
+                    if changed_columns:
+                        _sync_magenta_tokens(state, magenta_controller)
 
-            frames = build_frames(
-                canvas_sizes,
-                floor_canvas=floor_canvas,
-                front_canvas=args.front_canvas,
-                state=state,
-            )
-            router.render(
-                frames,
-                display=True,
-                block=False,
-                use_optimized=args.use_optimized,
-                sync_display=True,
-            )
+            if magenta_controller is not None:
+                magenta_controller.poll()
+                magenta_status = magenta_controller.status_text()
+                current_style_tokens = list(magenta_controller.current_style_tokens)
+                if magenta_status != state.magenta_status:
+                    state.magenta_status = magenta_status
+                if current_style_tokens != state.current_style_tokens:
+                    state.current_style_tokens = current_style_tokens
+            visual_signature = _visual_state_signature(state)
+            if visual_signature != last_visual_signature:
+                frames = build_frames(
+                    canvas_sizes,
+                    floor_canvas=floor_canvas,
+                    front_canvas=args.front_canvas,
+                    state=state,
+                )
+                router.render(
+                    frames,
+                    display=True,
+                    block=False,
+                    use_optimized=args.use_optimized,
+                    sync_display=True,
+                )
+                last_visual_signature = visual_signature
             clock.tick(args.fps)
     finally:
         if pose_source is not None:
             pose_source.close()
+        if magenta_controller is not None:
+            magenta_controller.close()
         pygame.quit()
 
 
