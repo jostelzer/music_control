@@ -15,7 +15,13 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
-from music_floor_prompt_banks import (
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if __package__ in (None, ""):
+    repo_root_str = str(REPO_ROOT)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+
+from floor_slots.music_floor_prompt_banks import (
     DEFAULT_PROMPT_BANK,
     PromptRow,
     format_prompt_bank_listing,
@@ -33,9 +39,8 @@ def _prepend_path(path: Path, package_name: str) -> bool:
 
 
 def _ensure_projection_mapping_on_path() -> None:
-    repo_root = Path(__file__).resolve().parent
     candidates = [
-        repo_root.parent / "projector-mapping",
+        REPO_ROOT.parent / "projector-mapping",
         Path.home() / "git" / "projector-mapping",
     ]
     for candidate in candidates:
@@ -48,9 +53,8 @@ def _ensure_projection_mapping_on_path() -> None:
 
 
 def _ensure_pose_stream_on_path() -> None:
-    repo_root = Path(__file__).resolve().parent
     pose_candidates = [
-        repo_root.parent / "3d_pose_estimation_optitrack" / "src",
+        REPO_ROOT.parent / "3d_pose_estimation_optitrack" / "src",
         Path.home() / "git" / "3d_pose_estimation_optitrack" / "src",
     ]
     if not any(_prepend_path(candidate, "pose_stream") for candidate in pose_candidates):
@@ -60,9 +64,9 @@ def _ensure_pose_stream_on_path() -> None:
         )
 
     lunar_candidates = [
-        repo_root.parent / "lunar_tools",
+        REPO_ROOT.parent / "lunar_tools",
         Path.home() / "git" / "lunar_tools",
-        repo_root.parent / "lunar_tools_refact",
+        REPO_ROOT.parent / "lunar_tools_refact",
         Path.home() / "git" / "lunar_tools_refact",
     ]
     if not any(_prepend_path(candidate, "lunar_tools") for candidate in lunar_candidates):

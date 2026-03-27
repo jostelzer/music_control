@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import argparse
-import atexit
 import importlib.util
+import os
+import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
-from music_floor_prompt_banks import (
+from floor_slots.music_floor_prompt_banks import (
     DEFAULT_PROMPT_BANK,
     format_prompt_bank_listing,
     resolve_prompt_rows,
@@ -25,8 +27,92 @@ DEFAULT_GUIDANCE_WEIGHT = 5.0
 DEFAULT_TARGET_BUFFER_FRAMES = 4
 DEFAULT_MAX_BUFFER_FRAMES = 12
 DEFAULT_ADAPTIVE_PLAYBACK = False
+DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 3.0
 
 _MAGENTA_CLIENT_MODULE = None
+
+
+class _ShutdownController:
+    def __init__(self, timeout_seconds: float):
+        self._timeout_seconds = max(0.0, float(timeout_seconds))
+        self._stop_requested = threading.Event()
+        self._force_exit_cancel: threading.Event | None = None
+        self._exit_code = 0
+        self._previous_handlers: dict[int, signal.Handlers] = {}
+
+    @property
+    def exit_code(self) -> int:
+        return self._exit_code
+
+    def stop_requested(self) -> bool:
+        return self._stop_requested.is_set()
+
+    def install(self) -> None:
+        for signum in (
+            getattr(signal, "SIGINT", None),
+            getattr(signal, "SIGTERM", None),
+        ):
+            if signum is None:
+                continue
+            try:
+                self._previous_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, self._handle_signal)
+            except (OSError, RuntimeError, ValueError):
+                continue
+
+    def finish(self) -> None:
+        self._cancel_force_exit()
+        for signum, handler in self._previous_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, RuntimeError, ValueError):
+                continue
+        self._previous_handlers.clear()
+
+    def request_stop(self, exit_code: int, reason: str) -> None:
+        if self._stop_requested.is_set():
+            print(f"{reason} Forcing exit.", file=sys.stderr, flush=True)
+            os._exit(exit_code)
+        self._exit_code = exit_code
+        self._stop_requested.set()
+        print(reason, file=sys.stderr, flush=True)
+        self._arm_force_exit(exit_code)
+
+    def _handle_signal(self, signum: int, _frame) -> None:
+        try:
+            signal_name = signal.Signals(signum).name
+        except ValueError:
+            signal_name = f"signal {signum}"
+        self.request_stop(128 + int(signum), f"{signal_name} received. Stopping player...")
+
+    def _arm_force_exit(self, exit_code: int) -> None:
+        if self._timeout_seconds <= 0 or self._force_exit_cancel is not None:
+            return
+        cancel_event = threading.Event()
+        self._force_exit_cancel = cancel_event
+
+        def _force_exit() -> None:
+            if cancel_event.wait(timeout=self._timeout_seconds):
+                return
+            print(
+                "Shutdown did not finish in "
+                f"{self._timeout_seconds:.1f}s. Forcing exit.",
+                file=sys.stderr,
+                flush=True,
+            )
+            os._exit(exit_code)
+
+        threading.Thread(
+            target=_force_exit,
+            name="music-floor-force-exit",
+            daemon=True,
+        ).start()
+
+    def _cancel_force_exit(self) -> None:
+        if self._force_exit_cancel is None:
+            return
+        self._force_exit_cancel.set()
+        self._force_exit_cancel = None
 
 
 def _load_magenta_client_module():
@@ -165,59 +251,62 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
     if args.list_prompt_banks:
         print(format_prompt_bank_listing())
-        return
+        return 0
 
-    module = _load_magenta_client_module()
-    client = module.RealtimeClient(
-        args.magenta_server_url,
-        local_audio=not args.no_local_audio,
-        output_device=args.output_device,
-    )
-    atexit.register(client.stop_session)
+    shutdown = _ShutdownController(DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
+    shutdown.install()
+    client = None
 
-    prompt_bank_name, prompt_rows = resolve_prompt_rows(
-        prompt_bank=args.prompt_bank,
-        prompt_file=args.prompt_file,
-        row_prompts=args.row_prompt,
-        legacy_music_prompt=args.music_prompt,
-    )
-    prompt = prompt_rows[0].prompt
-    tokens = list(client.update_style(prompt))
-    generation_kwargs = module._build_generation_kwargs(
-        client,
-        decode_window=args.decode_window,
-        crossfade_frames=args.crossfade_frames,
-        temperature=args.temperature,
-        topk=args.topk,
-        guidance_weight=args.guidance_weight,
-        fixed_seed_enabled=False,
-        fixed_seed=0,
-    )
-
-    client.start_session(
-        style_text=prompt,
-        style_tokens=tokens,
-        style_source="prompt",
-        generation_kwargs=generation_kwargs,
-        adaptive_playback=args.adaptive_playback,
-        target_buffer_frames=args.target_buffer_frames,
-        max_buffer_frames=args.max_buffer_frames,
-    )
-
-    print(f"server={client.server_url}", flush=True)
-    print(f"prompt_bank={prompt_bank_name}", flush=True)
-    print(f"prompt={prompt}", flush=True)
-    print(f"style_tokens={tokens}", flush=True)
-    if args.status_interval > 0:
-        print(client.status_text(), flush=True)
-
-    next_status_time = time.monotonic() + max(0.1, args.status_interval)
     try:
-        while True:
+        module = _load_magenta_client_module()
+        client = module.RealtimeClient(
+            args.magenta_server_url,
+            local_audio=not args.no_local_audio,
+            output_device=args.output_device,
+        )
+
+        prompt_bank_name, prompt_rows = resolve_prompt_rows(
+            prompt_bank=args.prompt_bank,
+            prompt_file=args.prompt_file,
+            row_prompts=args.row_prompt,
+            legacy_music_prompt=args.music_prompt,
+        )
+        prompt = prompt_rows[0].prompt
+        tokens = list(client.update_style(prompt))
+        generation_kwargs = module._build_generation_kwargs(
+            client,
+            decode_window=args.decode_window,
+            crossfade_frames=args.crossfade_frames,
+            temperature=args.temperature,
+            topk=args.topk,
+            guidance_weight=args.guidance_weight,
+            fixed_seed_enabled=False,
+            fixed_seed=0,
+        )
+
+        client.start_session(
+            style_text=prompt,
+            style_tokens=tokens,
+            style_source="prompt",
+            generation_kwargs=generation_kwargs,
+            adaptive_playback=args.adaptive_playback,
+            target_buffer_frames=args.target_buffer_frames,
+            max_buffer_frames=args.max_buffer_frames,
+        )
+
+        print(f"server={client.server_url}", flush=True)
+        print(f"prompt_bank={prompt_bank_name}", flush=True)
+        print(f"prompt={prompt}", flush=True)
+        print(f"style_tokens={tokens}", flush=True)
+        if args.status_interval > 0:
+            print(client.status_text(), flush=True)
+
+        next_status_time = time.monotonic() + max(0.1, args.status_interval)
+        while not shutdown.stop_requested():
             time.sleep(0.1)
             if args.status_interval <= 0:
                 continue
@@ -227,10 +316,16 @@ def main() -> None:
             print(client.status_text(), flush=True)
             next_status_time = now + max(0.1, args.status_interval)
     except KeyboardInterrupt:
-        pass
+        shutdown.request_stop(130, "Keyboard interrupt received. Stopping player...")
     finally:
-        client.stop_session()
+        try:
+            if client is not None:
+                client.stop_session()
+        finally:
+            shutdown.finish()
+
+    return shutdown.exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

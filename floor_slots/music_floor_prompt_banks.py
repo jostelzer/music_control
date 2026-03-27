@@ -1,3 +1,5 @@
+"""Prompt banks for Music Floor slot selection."""
+
 from __future__ import annotations
 
 import json
