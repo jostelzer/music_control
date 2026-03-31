@@ -1659,12 +1659,20 @@ def create_front_frame(
             panel_rect.left + 24,
             header_y + panel_title_font.get_height() + 6,
         )
+        _render_text(
+            surface,
+            f"Current seed: {_truncate_text(state.prompt_bank_name, 84)}",
+            row_font,
+            TEXT_MUTED,
+            panel_rect.left + 24,
+            header_y + panel_title_font.get_height() + row_font.get_height() + 14,
+        )
 
         editor_rect = pygame.Rect(
             panel_rect.left + 20,
-            header_y + panel_title_font.get_height() + row_font.get_height() + 24,
+            header_y + panel_title_font.get_height() + row_font.get_height() * 2 + 32,
             panel_rect.width - 40,
-            panel_rect.height - panel_title_font.get_height() - row_font.get_height() - 68,
+            panel_rect.height - panel_title_font.get_height() - row_font.get_height() * 2 - 76,
         )
         pygame.draw.rect(surface, PROMPT_EDIT_PANEL, editor_rect, border_radius=16)
         pygame.draw.rect(
@@ -1675,7 +1683,7 @@ def create_front_frame(
             border_radius=16,
         )
 
-        draft_prompt = state.prompt_edit_text if state.prompt_edit_text else state.prompt_bank_name
+        draft_prompt = state.prompt_edit_text
         wrapped_lines = _wrap_text(f"{draft_prompt}|", row_font, editor_rect.width - 28)
         text_y = editor_rect.top + 16
         for line in wrapped_lines[:6]:
@@ -2020,13 +2028,13 @@ def _load_seed_prompt_state(
 
 def _start_prompt_edit(state: GridState) -> None:
     state.prompt_edit_active = True
-    state.prompt_edit_text = state.prompt_bank_name
+    state.prompt_edit_text = ""
     state.prompt_edit_status = "Editing seed prompt. Enter applies; Esc cancels."
 
 
 def _cancel_prompt_edit(state: GridState) -> None:
     state.prompt_edit_active = False
-    state.prompt_edit_text = state.prompt_bank_name
+    state.prompt_edit_text = ""
     state.prompt_edit_status = "Seed prompt edit canceled. Press P to edit again."
 
 
@@ -2040,7 +2048,7 @@ def _apply_seed_prompt_edit(
     try:
         magenta_controller.reseed_prompt(state.prompt_edit_text)
         _load_seed_prompt_state(state, magenta_controller)
-        state.prompt_edit_text = state.prompt_bank_name
+        state.prompt_edit_text = ""
         state.prompt_edit_active = False
         state.prompt_edit_status = "Seed prompt updated. Press P to edit again."
         return True
