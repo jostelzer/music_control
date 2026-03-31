@@ -300,6 +300,14 @@ def _seconds_to_frames(seconds: float, frame_length_samples: int, sample_rate: i
     return int(math.ceil(seconds / frame_seconds))
 
 
+def _frames_to_seconds(frames: int, frame_length_samples: int, sample_rate: int) -> float:
+    frames = max(0, int(frames))
+    frame_seconds = float(frame_length_samples) / float(sample_rate)
+    if frame_seconds <= 0:
+        raise ValueError("Frame duration must be positive.")
+    return frames * frame_seconds
+
+
 def _prompt_was_explicitly_requested(args: argparse.Namespace) -> bool:
     if args.prompt_file or args.music_prompt:
         return True
@@ -433,6 +441,23 @@ def main() -> int:
                 client.frame_length_samples,
                 client.sample_rate,
             )
+        active_context_frames = int(
+            generation_kwargs.get(
+                "context_length_frames",
+                int(args.context_frames) if args.context_frames is not None else 0,
+            )
+        )
+        active_decode_frames = int(generation_kwargs.get("max_decode_frames", args.decode_window))
+        active_crossfade_frames = int(
+            round(
+                int(generation_kwargs.get("crossfade_samples", 0))
+                / float(max(1, client.frame_length_samples))
+            )
+        )
+        default_context_frames_fn = getattr(client, "default_context_frames", None)
+        default_context_frames = (
+            int(default_context_frames_fn()) if callable(default_context_frames_fn) else None
+        )
 
         client.start_session(
             style_text=startup_style_text,
@@ -449,6 +474,31 @@ def main() -> int:
         print(f"startup_style_source={startup_style_source}", flush=True)
         print(f"prompt={startup_style_text}", flush=True)
         print(f"style_tokens={tokens}", flush=True)
+        print(
+            "generation="
+            f"emit_frames={active_decode_frames} "
+            f"context_frames={active_context_frames} "
+            f"crossfade_frames={active_crossfade_frames} "
+            f"temperature={float(generation_kwargs.get('temperature', args.temperature)):.2f} "
+            f"topk={int(generation_kwargs.get('topk', args.topk))} "
+            f"guidance_weight={float(generation_kwargs.get('guidance_weight', args.guidance_weight)):.2f}",
+            flush=True,
+        )
+        if default_context_frames is not None:
+            print(f"context_default_frames={default_context_frames}", flush=True)
+        print(
+            "buffer_frames="
+            f"target={target_buffer_frames} "
+            f"max={max_buffer_frames} "
+            f"adaptive_playback={bool(args.adaptive_playback)}",
+            flush=True,
+        )
+        print(
+            "buffer_seconds="
+            f"target={_frames_to_seconds(target_buffer_frames, client.frame_length_samples, client.sample_rate):.3f} "
+            f"max={_frames_to_seconds(max_buffer_frames, client.frame_length_samples, client.sample_rate):.3f}",
+            flush=True,
+        )
         if args.status_interval > 0:
             print(client.status_text(), flush=True)
 
