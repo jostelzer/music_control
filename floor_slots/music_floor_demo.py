@@ -10,7 +10,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -22,11 +22,12 @@ if __package__ in (None, ""):
         sys.path.insert(0, repo_root_str)
 
 from floor_slots.music_floor_prompt_banks import (
-    DEFAULT_PROMPT_BANK,
     PromptRow,
     format_prompt_bank_listing,
     resolve_prompt_rows,
 )
+
+DEMO_DEFAULT_PROMPT_BANK = "minimal_techno_close"
 
 
 def _prepend_path(path: Path, package_name: str) -> bool:
@@ -100,6 +101,10 @@ DEFAULT_ROW_INDEX = STYLE_ROW_INDEX
 STYLE_TOKEN_MIN = 0
 STYLE_TOKEN_MAX = 1023
 DEFAULT_MAGENTA_SERVER_URL = "http://graciosa:8013"
+DEFAULT_POSE_PROTOCOL = "lucid"
+DEFAULT_LUCID_POSE_SERVICE = "pose3d-yolo26-pose-yolo26l"
+DEFAULT_LUCID_POSE_PORT = 8048
+DEFAULT_ZMQ_POSE_PORT = 5570
 
 BLACK = (0, 0, 0)
 TEXT_MAIN = (235, 235, 235)
@@ -122,6 +127,13 @@ FRONT_PANEL = (20, 20, 20)
 FRONT_PANEL_BORDER = (80, 80, 80)
 FRONT_PANEL_ACTIVE = (20, 56, 26)
 FRONT_PANEL_ACTIVE_BORDER = (84, 190, 100)
+FRONT_BUTTON_FILL = (34, 34, 34)
+FRONT_BUTTON_BORDER = (110, 110, 110)
+FRONT_BUTTON_TEXT = (236, 236, 236)
+FRONT_BUTTON_HINT = (170, 170, 170)
+EMULATION_BG = (8, 8, 8)
+EMULATION_MARGIN = 24
+EMULATION_GAP = 24
 
 
 @dataclass
@@ -165,12 +177,19 @@ class GridState:
     frame_index: int | None = None
     timestamp_iso: str | None = None
     pose_status: str = "static rows"
-    prompt_bank_name: str = DEFAULT_PROMPT_BANK
+    prompt_bank_name: str = DEMO_DEFAULT_PROMPT_BANK
     magenta_server_url: str = DEFAULT_MAGENTA_SERVER_URL
     magenta_status: str = "magenta idle"
 
 
-class PoseStreamSource:
+@dataclass(frozen=True)
+class EmulationLayout:
+    window_size: Size
+    floor_rect: pygame.Rect
+    front_rect: pygame.Rect | None
+
+
+class ZmqPoseStreamSource:
     def __init__(
         self,
         endpoint: str,
@@ -183,6 +202,7 @@ class PoseStreamSource:
 
         self.endpoint = endpoint
         self.port = port
+        self.label = f"pose zmq {endpoint}:{port}"
         self.poll_interval = max(0.001, poll_interval)
         self._client = PoseStreamClient(
             endpoint=endpoint,
@@ -211,6 +231,126 @@ class PoseStreamSource:
 
     def close(self) -> None:
         self._client.close()
+
+
+class LucidPoseSource:
+    def __init__(
+        self,
+        endpoint: str,
+        port: int,
+        timeout: float,
+        poll_interval: float,
+        service_name: str,
+    ) -> None:
+        self.endpoint = endpoint
+        self.port = port
+        self.service_name = (service_name or "").strip()
+        if not self.service_name:
+            raise ValueError("Lucid pose service name is required.")
+        self.timeout = max(0.001, timeout)
+        self.poll_interval = max(0.001, poll_interval)
+        self.base_url = self._build_base_url(endpoint, port)
+        self.label = f"pose lucid {self.service_name} @ {self.base_url}"
+        self._last_sequence: int | None = None
+        self._next_poll_at = 0.0
+
+        info = self._request_json("/info")
+        detected_service = str(info.get("service") or "").strip()
+        if detected_service and detected_service != self.service_name:
+            raise RuntimeError(
+                f"Expected Lucid pose service {self.service_name!r}, "
+                f"but {self.base_url} reports {detected_service!r}."
+            )
+
+    @staticmethod
+    def _build_base_url(endpoint: str, port: int) -> str:
+        host = (endpoint or "").strip()
+        if not host:
+            raise ValueError("Pose endpoint is required.")
+        if "://" in host:
+            parsed = urllib_parse.urlparse(host)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                raise ValueError("Lucid pose endpoint must be a host or http(s) URL.")
+            base_url = host.rstrip("/")
+            if parsed.port is None and port:
+                netloc = f"{parsed.hostname}:{int(port)}"
+                if parsed.username:
+                    auth = parsed.username
+                    if parsed.password:
+                        auth = f"{auth}:{parsed.password}"
+                    netloc = f"{auth}@{netloc}"
+                base_url = urllib_parse.urlunparse(
+                    (
+                        parsed.scheme,
+                        netloc,
+                        parsed.path or "",
+                        parsed.params or "",
+                        parsed.query or "",
+                        parsed.fragment or "",
+                    )
+                ).rstrip("/")
+            return base_url
+        return f"http://{host}:{int(port)}"
+
+    def _request_json(self, path: str) -> Dict[str, Any]:
+        request = urllib_request.Request(f"{self.base_url}{path}", method="GET")
+        try:
+            with urllib_request.urlopen(request, timeout=self.timeout) as response:
+                payload = response.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"GET {path} failed: {exc.code} {details}") from exc
+        except urllib_error.URLError as exc:
+            raise RuntimeError(f"GET {path} failed: {exc.reason}") from exc
+
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"GET {path} returned invalid JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"GET {path} returned {type(data).__name__}, expected object.")
+        return data
+
+    def poll_latest(self):
+        now = time.monotonic()
+        if now < self._next_poll_at:
+            return None
+        self._next_poll_at = now + self.poll_interval
+
+        payload = self._request_json("/poses/latest")
+        message = payload.get("message")
+        sequence = payload.get("sequence")
+        try:
+            sequence_value = int(sequence) if sequence is not None else None
+        except (TypeError, ValueError):
+            sequence_value = None
+
+        if (
+            sequence_value is not None
+            and self._last_sequence is not None
+            and sequence_value <= self._last_sequence
+        ):
+            return None
+        if sequence_value is not None:
+            self._last_sequence = sequence_value
+
+        if not isinstance(message, dict):
+            return None
+        return message
+
+    def wait_for_latest(self, max_wait_seconds: float):
+        deadline = time.monotonic() + max(0.0, max_wait_seconds)
+        latest = self.poll_latest()
+        while latest is None and time.monotonic() < deadline:
+            time.sleep(self.poll_interval)
+            latest = self.poll_latest()
+        return latest
+
+    def close(self) -> None:
+        return None
+
+
+PoseSource = ZmqPoseStreamSource | LucidPoseSource
 
 
 class MagentaController:
@@ -293,6 +433,24 @@ class MagentaController:
             )
         return [int(token) for token in response]
 
+    def _consume_control_response(
+        self,
+        response,
+        fallback_tokens: List[int],
+        *,
+        status_prefix: str,
+    ) -> None:
+        if isinstance(response, dict) and isinstance(response.get("style_tokens"), list):
+            self.current_style_tokens = [int(token) for token in response["style_tokens"]]
+        else:
+            self.current_style_tokens = [int(token) for token in fallback_tokens]
+        session_is_active = bool(response.get("session_is_active")) if isinstance(response, dict) else False
+        playback_state = str(response.get("playback_state") or "unknown") if isinstance(response, dict) else "unknown"
+        session_text = "session active" if session_is_active else "no player session"
+        self._latest_status = (
+            f"{status_prefix} {session_text} | playback={playback_state.lower()} @ {self.server_url}"
+        )
+
     def _apply_control(self, style_tokens: List[int]) -> None:
         response = self._request_json(
             "POST",
@@ -302,15 +460,10 @@ class MagentaController:
             ),
             content_type="application/json",
         )
-        if isinstance(response, dict) and isinstance(response.get("style_tokens"), list):
-            self.current_style_tokens = [int(token) for token in response["style_tokens"]]
-        else:
-            self.current_style_tokens = [int(token) for token in style_tokens]
-        session_is_active = bool(response.get("session_is_active")) if isinstance(response, dict) else False
-        playback_state = str(response.get("playback_state") or "unknown") if isinstance(response, dict) else "unknown"
-        session_text = "session active" if session_is_active else "no player session"
-        self._latest_status = (
-            f"server control {session_text} | playback={playback_state.lower()} @ {self.server_url}"
+        self._consume_control_response(
+            response,
+            [int(token) for token in style_tokens],
+            status_prefix="server control",
         )
 
     def poll(self) -> None:
@@ -319,6 +472,20 @@ class MagentaController:
     def update_style_tokens(self, style_tokens: List[int]) -> List[int]:
         tokens = [int(token) for token in style_tokens]
         self._apply_control(tokens)
+        return list(self.current_style_tokens)
+
+    def reset_context(self) -> List[int]:
+        response = self._request_json(
+            "POST",
+            "/reset_context",
+            data=b"{}",
+            content_type="application/json",
+        )
+        self._consume_control_response(
+            response,
+            list(self.current_style_tokens),
+            status_prefix="context reset",
+        )
         return list(self.current_style_tokens)
 
     def status_text(self) -> str:
@@ -364,16 +531,33 @@ def parse_args() -> argparse.Namespace:
         help="Render and save previews, then exit without opening projector windows.",
     )
     parser.add_argument(
+        "--emulate",
+        action="store_true",
+        help="Run in a single local Pygame window and emulate floor tracking from mouse clicks.",
+    )
+    parser.add_argument(
         "--pose-endpoint",
         type=str,
         default="iki",
-        help="ZMQ pose stream hostname/IP.",
+        help="Pose host/IP. For Lucid this is the service host; for ZMQ it is the stream host.",
+    )
+    parser.add_argument(
+        "--pose-protocol",
+        choices=("lucid", "zmq"),
+        default=DEFAULT_POSE_PROTOCOL,
+        help="Pose transport to use. Defaults to Lucid HTTP.",
+    )
+    parser.add_argument(
+        "--pose-service",
+        type=str,
+        default=DEFAULT_LUCID_POSE_SERVICE,
+        help="Lucid pose service name when --pose-protocol=lucid.",
     )
     parser.add_argument(
         "--pose-port",
         type=int,
-        default=5570,
-        help="Pose stream TCP port.",
+        default=None,
+        help="Pose TCP port. Defaults to 8048 for Lucid or 5570 for ZMQ.",
     )
     parser.add_argument(
         "--pose-timeout",
@@ -396,7 +580,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt-bank",
         type=str,
-        default=DEFAULT_PROMPT_BANK,
+        default=DEMO_DEFAULT_PROMPT_BANK,
         help="Built-in six-row prompt bank for the floor grid.",
     )
     parser.add_argument(
@@ -599,9 +783,25 @@ def _sample_from_floor_point(
     )
 
 
+def _message_value(payload: Any, key: str, default=None):
+    if isinstance(payload, dict):
+        return payload.get(key, default)
+    return getattr(payload, key, default)
+
+
+def _message_items(payload: Any, key: str) -> List[Any]:
+    value = _message_value(payload, key, [])
+    return value if isinstance(value, list) else []
+
+
+def _message_mapping(payload: Any, key: str) -> Dict[str, Any]:
+    value = _message_value(payload, key, {})
+    return value if isinstance(value, dict) else {}
+
+
 def _extract_position_from_keypoint(keypoint) -> Tuple[float, float, float] | None:
-    position = getattr(keypoint, "position", None)
-    if not isinstance(position, tuple) or len(position) != 3:
+    position = _message_value(keypoint, "position", None)
+    if not isinstance(position, (list, tuple)) or len(position) != 3:
         return None
     try:
         return (float(position[0]), float(position[1]), float(position[2]))
@@ -611,18 +811,19 @@ def _extract_position_from_keypoint(keypoint) -> Tuple[float, float, float] | No
 
 def _extract_floor_samples_from_message(message) -> List[PersonFloorSample]:
     samples: List[PersonFloorSample] = []
-    for person in getattr(message, "people", []):
+    for person in _message_items(message, "people"):
         ankle_positions: List[Tuple[float, float, float]] = []
         ankle_confidences: List[float] = []
+        keypoints = _message_mapping(person, "keypoints")
         for keypoint_name in ("left_ankle", "right_ankle"):
-            keypoint = person.keypoints.get(keypoint_name)
+            keypoint = keypoints.get(keypoint_name)
             if keypoint is None:
                 continue
             position = _extract_position_from_keypoint(keypoint)
             if position is None:
                 continue
             ankle_positions.append(position)
-            confidence = getattr(keypoint, "confidence", None)
+            confidence = _message_value(keypoint, "confidence", None)
             try:
                 if confidence is not None:
                     ankle_confidences.append(float(confidence))
@@ -641,7 +842,7 @@ def _extract_floor_samples_from_message(message) -> List[PersonFloorSample]:
         )
 
         sample = _sample_from_floor_point(
-            person_id=int(getattr(person, "id", 0)),
+            person_id=int(_message_value(person, "id", 0)),
             x=z,
             z=x,
             confidence=confidence,
@@ -700,6 +901,50 @@ def _truncate_text(text: str, max_chars: int) -> str:
     if len(cleaned) <= max_chars:
         return cleaned
     return f"{cleaned[: max(0, max_chars - 1)].rstrip()}…"
+
+
+def _front_reset_button_rect(size: Size) -> pygame.Rect:
+    width, height = size
+    left_pad = int(round(width * 0.06))
+    top_pad = int(round(height * 0.07))
+    button_width = max(180, int(round(width * 0.22)))
+    button_height = max(42, int(round(height * 0.075)))
+    return pygame.Rect(
+        width - left_pad - button_width,
+        top_pad,
+        button_width,
+        button_height,
+    )
+
+
+def _scale_rect_to_dest(
+    rect: pygame.Rect,
+    src_size: Size,
+    dest_rect: pygame.Rect,
+) -> pygame.Rect:
+    src_width = max(1, int(src_size[0]))
+    src_height = max(1, int(src_size[1]))
+    return pygame.Rect(
+        dest_rect.left + int(round(rect.left * dest_rect.width / src_width)),
+        dest_rect.top + int(round(rect.top * dest_rect.height / src_height)),
+        max(1, int(round(rect.width * dest_rect.width / src_width))),
+        max(1, int(round(rect.height * dest_rect.height / src_height))),
+    )
+
+
+def _emulation_reset_button_hit(
+    *,
+    layout: EmulationLayout,
+    front_size: Size,
+    mouse_position: Tuple[int, int],
+) -> bool:
+    if layout.front_rect is None:
+        return False
+    if not layout.front_rect.collidepoint(mouse_position):
+        return False
+    button_rect = _front_reset_button_rect(front_size)
+    scaled_button_rect = _scale_rect_to_dest(button_rect, front_size, layout.front_rect)
+    return scaled_button_rect.collidepoint(mouse_position)
 
 
 def create_floor_frame(size: Size, state: GridState) -> pygame.Surface:
@@ -779,7 +1024,12 @@ def create_floor_frame(size: Size, state: GridState) -> pygame.Surface:
     return surface
 
 
-def create_front_frame(size: Size, state: GridState) -> pygame.Surface:
+def create_front_frame(
+    size: Size,
+    state: GridState,
+    *,
+    show_reset_button: bool = False,
+) -> pygame.Surface:
     surface = pygame.Surface(size)
     surface.fill(BLACK)
     width, height = size
@@ -840,6 +1090,27 @@ def create_front_frame(size: Size, state: GridState) -> pygame.Surface:
         left_pad,
         top_pad + title_font.get_height() + subtitle_font.get_height() * 4 + 62,
     )
+
+    if show_reset_button:
+        reset_button_rect = _front_reset_button_rect(size)
+        pygame.draw.rect(surface, FRONT_BUTTON_FILL, reset_button_rect, border_radius=16)
+        pygame.draw.rect(
+            surface,
+            FRONT_BUTTON_BORDER,
+            reset_button_rect,
+            width=3,
+            border_radius=16,
+        )
+        reset_label_surface = panel_title_font.render("Reset Context", True, FRONT_BUTTON_TEXT)
+        reset_label_rect = reset_label_surface.get_rect(
+            center=(reset_button_rect.centerx, reset_button_rect.centery - 8)
+        )
+        surface.blit(reset_label_surface, reset_label_rect)
+        reset_hint_surface = panel_status_font.render("Press R", True, FRONT_BUTTON_HINT)
+        reset_hint_rect = reset_hint_surface.get_rect(
+            center=(reset_button_rect.centerx, reset_button_rect.centery + 16)
+        )
+        surface.blit(reset_hint_surface, reset_hint_rect)
 
     legend_top = top_pad + title_font.get_height() + subtitle_font.get_height() * 5 + 82
     legend_col_gap = int(round(width * 0.03))
@@ -937,6 +1208,8 @@ def build_frames(
     floor_canvas: str,
     front_canvas: str,
     state: GridState,
+    *,
+    show_reset_button: bool = False,
 ) -> Dict[str, pygame.Surface]:
     if floor_canvas not in canvas_sizes:
         raise SystemExit(
@@ -946,8 +1219,88 @@ def build_frames(
         floor_canvas: create_floor_frame(canvas_sizes[floor_canvas], state),
     }
     if front_canvas in canvas_sizes:
-        frames[front_canvas] = create_front_frame(canvas_sizes[front_canvas], state)
+        frames[front_canvas] = create_front_frame(
+            canvas_sizes[front_canvas],
+            state,
+            show_reset_button=show_reset_button,
+        )
     return frames
+
+
+def _build_emulation_layout(
+    canvas_sizes: Dict[str, Size],
+    floor_canvas: str,
+    front_canvas: str,
+) -> EmulationLayout:
+    floor_size = canvas_sizes[floor_canvas]
+    front_size = canvas_sizes.get(front_canvas)
+    display_info = pygame.display.Info()
+    max_width = max(960, int(round(display_info.current_w * 0.9)))
+    max_height = max(720, int(round(display_info.current_h * 0.9)))
+
+    raw_width = floor_size[0] + EMULATION_MARGIN * 2
+    if front_size is not None:
+        raw_width += EMULATION_GAP + front_size[0]
+    raw_height = max(floor_size[1], front_size[1] if front_size is not None else 0) + EMULATION_MARGIN * 2
+
+    scale = min(max_width / raw_width, max_height / raw_height, 1.0)
+    scale = max(scale, 0.2)
+    margin = max(12, int(round(EMULATION_MARGIN * scale)))
+    gap = max(12, int(round(EMULATION_GAP * scale))) if front_size is not None else 0
+    floor_render = (
+        max(1, int(round(floor_size[0] * scale))),
+        max(1, int(round(floor_size[1] * scale))),
+    )
+    front_render = None
+    if front_size is not None:
+        front_render = (
+            max(1, int(round(front_size[0] * scale))),
+            max(1, int(round(front_size[1] * scale))),
+        )
+
+    content_height = max(floor_render[1], front_render[1] if front_render is not None else 0)
+    window_width = floor_render[0] + margin * 2 + (gap + front_render[0] if front_render is not None else 0)
+    window_height = content_height + margin * 2
+
+    floor_rect = pygame.Rect(
+        margin,
+        margin + (content_height - floor_render[1]) // 2,
+        floor_render[0],
+        floor_render[1],
+    )
+    front_rect = None
+    if front_render is not None:
+        front_rect = pygame.Rect(
+            floor_rect.right + gap,
+            margin + (content_height - front_render[1]) // 2,
+            front_render[0],
+            front_render[1],
+        )
+    return EmulationLayout(
+        window_size=(window_width, window_height),
+        floor_rect=floor_rect,
+        front_rect=front_rect,
+    )
+
+
+def _render_emulation_window(
+    display_surface: pygame.Surface,
+    layout: EmulationLayout,
+    frames: Dict[str, pygame.Surface],
+    floor_canvas: str,
+    front_canvas: str,
+) -> None:
+    display_surface.fill(EMULATION_BG)
+    floor_surface = frames[floor_canvas]
+    floor_scaled = pygame.transform.smoothscale(floor_surface, layout.floor_rect.size)
+    display_surface.blit(floor_scaled, layout.floor_rect)
+
+    if layout.front_rect is not None and front_canvas in frames:
+        front_surface = frames[front_canvas]
+        front_scaled = pygame.transform.smoothscale(front_surface, layout.front_rect.size)
+        display_surface.blit(front_scaled, layout.front_rect)
+
+    pygame.display.flip()
 
 
 def save_previews(
@@ -1015,12 +1368,29 @@ def _connect_magenta_controller(
         raise SystemExit(f"Could not start Magenta control: {exc}") from exc
 
 
-def _connect_pose_source(args: argparse.Namespace) -> PoseStreamSource | None:
+def _resolve_pose_port(protocol: str, requested_port: int | None) -> int:
+    if requested_port is not None:
+        return int(requested_port)
+    if protocol == "lucid":
+        return DEFAULT_LUCID_POSE_PORT
+    return DEFAULT_ZMQ_POSE_PORT
+
+
+def _connect_pose_source(args: argparse.Namespace) -> PoseSource | None:
     if not args.pose_endpoint:
         return None
-    return PoseStreamSource(
+    port = _resolve_pose_port(args.pose_protocol, args.pose_port)
+    if args.pose_protocol == "lucid":
+        return LucidPoseSource(
+            endpoint=args.pose_endpoint,
+            port=port,
+            timeout=args.pose_timeout,
+            poll_interval=args.pose_poll_interval,
+            service_name=args.pose_service,
+        )
+    return ZmqPoseStreamSource(
         endpoint=args.pose_endpoint,
-        port=args.pose_port,
+        port=port,
         timeout=args.pose_timeout,
         poll_interval=args.pose_poll_interval,
     )
@@ -1042,8 +1412,7 @@ def _apply_debug_people_if_any(state: GridState, args: argparse.Namespace) -> Li
 def _apply_pose_message_if_any(
     state: GridState,
     message,
-    endpoint: str,
-    port: int,
+    source_label: str,
 ) -> List[int]:
     if message is None:
         return []
@@ -1051,9 +1420,72 @@ def _apply_pose_message_if_any(
     return _apply_samples_to_state(
         state,
         samples,
-        pose_status=f"pose {endpoint}:{port}",
-        frame_index=getattr(message, "frame_index", None),
-        timestamp_iso=getattr(message, "timestamp_iso", None),
+        pose_status=source_label,
+        frame_index=_message_value(message, "frame_index", None),
+        timestamp_iso=_message_value(message, "timestamp_iso", None),
+    )
+
+
+def _cursor_to_floor_point(
+    floor_rect: pygame.Rect,
+    mouse_position: Tuple[int, int],
+) -> Tuple[float, float] | None:
+    if floor_rect.width <= 0 or floor_rect.height <= 0:
+        return None
+    if not floor_rect.collidepoint(mouse_position):
+        return None
+
+    x_norm = (mouse_position[0] - floor_rect.left) / float(floor_rect.width)
+    y_norm = (mouse_position[1] - floor_rect.top) / float(floor_rect.height)
+    x_norm = max(0.0, min(1.0, x_norm))
+    y_norm = max(0.0, min(1.0, y_norm))
+    world_x = WORLD_MIN + x_norm * (WORLD_MAX - WORLD_MIN)
+    world_z = WORLD_MAX - y_norm * (WORLD_MAX - WORLD_MIN)
+    return world_x, world_z
+
+
+def _apply_emulated_cursor(
+    state: GridState,
+    *,
+    mouse_down: bool,
+    mouse_position: Tuple[int, int],
+    click_position: Tuple[int, int] | None,
+    floor_rect: pygame.Rect,
+) -> List[int]:
+    target_position = mouse_position if mouse_down else click_position
+    if target_position is None:
+        return _apply_samples_to_state(
+            state,
+            [],
+            pose_status="emulate cursor ready",
+            frame_index=None,
+            timestamp_iso=None,
+        )
+
+    floor_point = _cursor_to_floor_point(floor_rect, target_position)
+    if floor_point is None:
+        return _apply_samples_to_state(
+            state,
+            [],
+            pose_status="emulate cursor off-floor",
+            frame_index=None,
+            timestamp_iso=None,
+        )
+
+    sample = _sample_from_floor_point(
+        person_id=1,
+        x=floor_point[0],
+        z=floor_point[1],
+        confidence=1.0,
+    )
+    samples = [sample] if sample is not None else []
+    pose_status = "emulate cursor active" if mouse_down else "emulate cursor click"
+    return _apply_samples_to_state(
+        state,
+        samples,
+        pose_status=pose_status,
+        frame_index=None,
+        timestamp_iso=None,
     )
 
 
@@ -1072,6 +1504,20 @@ def _sync_magenta_tokens(
     else:
         state.current_style_tokens = next_tokens
     return True
+
+
+def _reset_magenta_context(
+    state: GridState,
+    magenta_controller: MagentaController | None,
+) -> None:
+    if magenta_controller is None:
+        state.magenta_status = "context reset unavailable: no magenta controller"
+        return
+    try:
+        state.current_style_tokens = list(magenta_controller.reset_context())
+        state.magenta_status = magenta_controller.status_text()
+    except Exception as exc:
+        state.magenta_status = f"context reset failed: {exc}"
 
 
 def _visual_state_signature(state: GridState) -> Tuple[object, ...]:
@@ -1122,6 +1568,8 @@ def main() -> None:
     state = GridState()
     magenta_controller = None
     pose_source = None
+    emulate_layout = None
+    emulate_window = None
 
     try:
         magenta_controller = _connect_magenta_controller(
@@ -1145,26 +1593,29 @@ def main() -> None:
         if _apply_debug_people_if_any(state, args):
             _sync_magenta_tokens(state, magenta_controller)
 
-        pose_source = _connect_pose_source(args)
+        if args.emulate:
+            state.pose_status = "emulate cursor ready"
+        else:
+            pose_source = _connect_pose_source(args)
         if pose_source is not None:
             bootstrap_message = pose_source.wait_for_latest(args.pose_bootstrap_seconds)
             if bootstrap_message is not None:
                 changed_columns = _apply_pose_message_if_any(
                     state,
                     bootstrap_message,
-                    args.pose_endpoint,
-                    args.pose_port,
+                    pose_source.label,
                 )
                 if changed_columns:
                     _sync_magenta_tokens(state, magenta_controller)
             elif state.pose_status == "static rows":
-                state.pose_status = f"pose {args.pose_endpoint}:{args.pose_port} waiting"
+                state.pose_status = f"{pose_source.label} waiting"
 
         frames = build_frames(
             canvas_sizes,
             floor_canvas=floor_canvas,
             front_canvas=args.front_canvas,
             state=state,
+            show_reset_button=args.emulate,
         )
 
         if args.preview_dir:
@@ -1180,31 +1631,76 @@ def main() -> None:
         if args.preview_only:
             return
 
-        router = CanvasProjectorRouter.from_room_config(
-            args.config,
-            caption_prefix="music-floor: ",
-            auto_display=True,
-            renderer_kwargs={"use_sdl2_window": True},
-        )
+        router = None
+        if args.emulate:
+            emulate_layout = _build_emulation_layout(
+                canvas_sizes,
+                floor_canvas=floor_canvas,
+                front_canvas=args.front_canvas,
+            )
+            emulate_window = pygame.display.set_mode(emulate_layout.window_size)
+            pygame.display.set_caption("music-floor emulate")
+        else:
+            router = CanvasProjectorRouter.from_room_config(
+                args.config,
+                caption_prefix="music-floor: ",
+                auto_display=True,
+                renderer_kwargs={"use_sdl2_window": True},
+            )
 
         clock = pygame.time.Clock()
         last_visual_signature = None
         running = True
+        emulate_mouse_down = False
+        emulate_click_position = None
+        reset_requested = False
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT or (
                     event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
                 ):
                     running = False
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                    reset_requested = True
+                if args.emulate:
+                    if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                        if (
+                            emulate_layout is not None
+                            and _emulation_reset_button_hit(
+                                layout=emulate_layout,
+                                front_size=canvas_sizes[args.front_canvas],
+                                mouse_position=event.pos,
+                            )
+                        ):
+                            reset_requested = True
+                        else:
+                            emulate_mouse_down = True
+                            emulate_click_position = event.pos
+                    elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                        emulate_mouse_down = False
 
-            if pose_source is not None:
+            if reset_requested:
+                _reset_magenta_context(state, magenta_controller)
+                reset_requested = False
+
+            if args.emulate and emulate_layout is not None:
+                changed_columns = _apply_emulated_cursor(
+                    state,
+                    mouse_down=emulate_mouse_down,
+                    mouse_position=pygame.mouse.get_pos(),
+                    click_position=emulate_click_position,
+                    floor_rect=emulate_layout.floor_rect,
+                )
+                emulate_click_position = None
+                if changed_columns:
+                    _sync_magenta_tokens(state, magenta_controller)
+            elif pose_source is not None:
                 latest_message = pose_source.poll_latest()
                 if latest_message is not None:
                     changed_columns = _apply_pose_message_if_any(
                         state,
                         latest_message,
-                        args.pose_endpoint,
-                        args.pose_port,
+                        pose_source.label,
                     )
                     if changed_columns:
                         _sync_magenta_tokens(state, magenta_controller)
@@ -1224,14 +1720,24 @@ def main() -> None:
                     floor_canvas=floor_canvas,
                     front_canvas=args.front_canvas,
                     state=state,
+                    show_reset_button=args.emulate,
                 )
-                router.render(
-                    frames,
-                    display=True,
-                    block=False,
-                    use_optimized=args.use_optimized,
-                    sync_display=True,
-                )
+                if args.emulate and emulate_window is not None and emulate_layout is not None:
+                    _render_emulation_window(
+                        emulate_window,
+                        emulate_layout,
+                        frames,
+                        floor_canvas=floor_canvas,
+                        front_canvas=args.front_canvas,
+                    )
+                elif router is not None:
+                    router.render(
+                        frames,
+                        display=True,
+                        block=False,
+                        use_optimized=args.use_optimized,
+                        sync_display=True,
+                    )
                 last_visual_signature = visual_signature
             clock.tick(args.fps)
     finally:

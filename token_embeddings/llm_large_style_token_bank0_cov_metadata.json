@@ -1,0 +1,15 @@
+{
+  "source": "/Users/jjj/git/magenta-realtime/.agents/style_embedding/llm_large_style_token_banks.npy",
+  "bank_index": 0,
+  "input_shape": [
+    1024,
+    1024
+  ],
+  "covariance_shape": [
+    1024,
+    1024
+  ],
+  "covariance_dtype": "float64",
+  "rowvar": false,
+  "interpretation": "rows are token embeddings within bank 0; columns are embedding dimensions"
+}

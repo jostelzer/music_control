@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import math
 import os
 import signal
 import sys
@@ -27,6 +28,7 @@ DEFAULT_GUIDANCE_WEIGHT = 5.0
 DEFAULT_TARGET_BUFFER_FRAMES = 4
 DEFAULT_MAX_BUFFER_FRAMES = 12
 DEFAULT_ADAPTIVE_PLAYBACK = False
+DEFAULT_AUDIO_BLOCKSIZE = 0
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 3.0
 
 _MAGENTA_CLIENT_MODULE = None
@@ -196,9 +198,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--decode-window",
+        "--emit-frames",
+        dest="decode_window",
         type=int,
         default=DEFAULT_DECODE_WINDOW,
-        help="Magenta decode window in frames.",
+        help="Emit frames per step / max decode frames.",
+    )
+    parser.add_argument(
+        "--context-frames",
+        type=int,
+        default=None,
+        help="Override context length in codec frames. Defaults to the server-provided value.",
     )
     parser.add_argument(
         "--crossfade-frames",
@@ -231,10 +241,22 @@ def parse_args() -> argparse.Namespace:
         help="Target audio buffer depth in frames.",
     )
     parser.add_argument(
+        "--target-buffer-seconds",
+        type=float,
+        default=None,
+        help="Target audio buffer depth in seconds. Overrides --target-buffer-frames.",
+    )
+    parser.add_argument(
         "--max-buffer-frames",
         type=int,
         default=DEFAULT_MAX_BUFFER_FRAMES,
         help="Maximum audio buffer depth in frames.",
+    )
+    parser.add_argument(
+        "--max-buffer-seconds",
+        type=float,
+        default=None,
+        help="Maximum audio buffer depth in seconds. Overrides --max-buffer-frames.",
     )
     parser.add_argument(
         "--status-interval",
@@ -248,7 +270,33 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ADAPTIVE_PLAYBACK,
         help="Enable adaptive playback timing. Disabled by default to match the Gradio demo.",
     )
+    parser.add_argument(
+        "--audio-backend",
+        choices=("callback", "blocking", "virtual", "blocking_virtual"),
+        default=None,
+        help="Local audio backend. Use 'blocking' for a more buffered path on flaky wireless links.",
+    )
+    parser.add_argument(
+        "--audio-latency",
+        type=str,
+        default=None,
+        help="sounddevice latency setting for local audio playback. Accepts 'low', 'high', or a numeric seconds value.",
+    )
+    parser.add_argument(
+        "--audio-blocksize",
+        type=int,
+        default=DEFAULT_AUDIO_BLOCKSIZE,
+        help="sounddevice blocksize for local audio playback. Use 0 to let the backend choose.",
+    )
     return parser.parse_args()
+
+
+def _seconds_to_frames(seconds: float, frame_length_samples: int, sample_rate: int) -> int:
+    seconds = max(0.0, float(seconds))
+    frame_seconds = float(frame_length_samples) / float(sample_rate)
+    if frame_seconds <= 0:
+        raise ValueError("Frame duration must be positive.")
+    return int(math.ceil(seconds / frame_seconds))
 
 
 def main() -> int:
@@ -267,6 +315,9 @@ def main() -> int:
             args.magenta_server_url,
             local_audio=not args.no_local_audio,
             output_device=args.output_device,
+            audio_backend=args.audio_backend,
+            audio_latency=args.audio_latency,
+            audio_blocksize=args.audio_blocksize,
         )
 
         prompt_bank_name, prompt_rows = resolve_prompt_rows(
@@ -275,6 +326,7 @@ def main() -> int:
             row_prompts=args.row_prompt,
             legacy_music_prompt=args.music_prompt,
         )
+        client.refresh_stream_info()
         prompt = prompt_rows[0].prompt
         tokens = list(client.update_style(prompt))
         generation_kwargs = module._build_generation_kwargs(
@@ -287,6 +339,22 @@ def main() -> int:
             fixed_seed_enabled=False,
             fixed_seed=0,
         )
+        if args.context_frames is not None:
+            generation_kwargs["context_length_frames"] = int(args.context_frames)
+        target_buffer_frames = int(args.target_buffer_frames)
+        max_buffer_frames = int(args.max_buffer_frames)
+        if args.target_buffer_seconds is not None:
+            target_buffer_frames = _seconds_to_frames(
+                args.target_buffer_seconds,
+                client.frame_length_samples,
+                client.sample_rate,
+            )
+        if args.max_buffer_seconds is not None:
+            max_buffer_frames = _seconds_to_frames(
+                args.max_buffer_seconds,
+                client.frame_length_samples,
+                client.sample_rate,
+            )
 
         client.start_session(
             style_text=prompt,
@@ -294,8 +362,8 @@ def main() -> int:
             style_source="prompt",
             generation_kwargs=generation_kwargs,
             adaptive_playback=args.adaptive_playback,
-            target_buffer_frames=args.target_buffer_frames,
-            max_buffer_frames=args.max_buffer_frames,
+            target_buffer_frames=target_buffer_frames,
+            max_buffer_frames=max_buffer_frames,
         )
 
         print(f"server={client.server_url}", flush=True)

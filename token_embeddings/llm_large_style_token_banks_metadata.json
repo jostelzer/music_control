@@ -1,0 +1,50 @@
+{
+  "source_param_dir": "/Users/jjj/git/magenta-realtime/.agents/checkpoints/llm_large_token_embedder/target.token_embedder.embedding",
+  "global_embedding_shape": [
+    29824,
+    1024
+  ],
+  "global_embedding_dtype": "float32",
+  "saved_array_shape": [
+    6,
+    1024,
+    1024
+  ],
+  "saved_array_dtype": "float32",
+  "style_offset": 17410,
+  "style_depth": 6,
+  "codebook_size": 1024,
+  "embedding_dim": 1024,
+  "row_ranges": [
+    {
+      "bank_index": 0,
+      "start_row": 17410,
+      "end_row_exclusive": 18434
+    },
+    {
+      "bank_index": 1,
+      "start_row": 18434,
+      "end_row_exclusive": 19458
+    },
+    {
+      "bank_index": 2,
+      "start_row": 19458,
+      "end_row_exclusive": 20482
+    },
+    {
+      "bank_index": 3,
+      "start_row": 20482,
+      "end_row_exclusive": 21506
+    },
+    {
+      "bank_index": 4,
+      "start_row": 21506,
+      "end_row_exclusive": 22530
+    },
+    {
+      "bank_index": 5,
+      "start_row": 22530,
+      "end_row_exclusive": 23554
+    }
+  ]
+}

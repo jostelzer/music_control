@@ -96,6 +96,32 @@ _PROMPT_BANKS: Dict[str, Tuple[PromptRow, ...]] = {
             prompt="jazz fusion workout, percussive mallets, rolling syncopation, playful, modern wide stereo image, timeless soundtrack feel, modal harmony",
         ),
     ),
+    "minimal_techno_close": (
+        PromptRow(
+            label="Rubber Step",
+            prompt="minimal techno, rubbery bassline, steady four on the floor, hypnotic, tight punchy compression, clean hi-fi sheen, minor key tension",
+        ),
+        PromptRow(
+            label="Tick Roll",
+            prompt="minimal techno, clicky percussion, rolling syncopation, focused, tight punchy compression, clean hi-fi sheen, minor key tension",
+        ),
+        PromptRow(
+            label="Dub Slide",
+            prompt="minimal techno, muted dub chords, slow-burning groove, brooding, lush reverb tail, warm analog blur, open fifth drones",
+        ),
+        PromptRow(
+            label="Acid Loop",
+            prompt="minimal techno, subtle acid bass, driving pulse, playful, clean hi-fi sheen, retro futurist, chromatic movement",
+        ),
+        PromptRow(
+            label="Stab Glide",
+            prompt="minimal techno, filtered synth stab, low-slung groove, mysterious, polished studio mix, modern streaming era, minor key tension",
+        ),
+        PromptRow(
+            label="Hat Swing",
+            prompt="minimal techno, shuffled hats, rolling sub bass, groovy, tight punchy compression, modern wide stereo image, minor key tension",
+        ),
+    ),
 }
 
 
