@@ -116,6 +116,7 @@ BLACK = (0, 0, 0)
 TEXT_MAIN = (235, 235, 235)
 TEXT_MUTED = (160, 160, 160)
 TEXT_ACCENT = (205, 205, 205)
+TEXT_ERROR = (232, 120, 120)
 
 FLOOR_COLUMN_FILL = (18, 18, 18)
 FLOOR_COLUMN_BORDER = (42, 42, 42)
@@ -137,6 +138,11 @@ FRONT_BUTTON_FILL = (34, 34, 34)
 FRONT_BUTTON_BORDER = (110, 110, 110)
 FRONT_BUTTON_TEXT = (236, 236, 236)
 FRONT_BUTTON_HINT = (170, 170, 170)
+PROMPT_EDIT_OVERLAY = (0, 0, 0, 176)
+PROMPT_EDIT_PANEL = (22, 22, 22)
+PROMPT_EDIT_PANEL_BORDER = (96, 96, 96)
+PROMPT_EDIT_PANEL_ACTIVE = (28, 56, 32)
+PROMPT_EDIT_PANEL_ACTIVE_BORDER = (84, 190, 100)
 EMULATION_BG = (8, 8, 8)
 EMULATION_MARGIN = 24
 EMULATION_GAP = 24
@@ -187,6 +193,9 @@ class GridState:
     magenta_server_url: str = DEFAULT_MAGENTA_SERVER_URL
     magenta_status: str = "magenta idle"
     generation_kwargs: Dict[str, Any] = field(default_factory=dict)
+    prompt_edit_active: bool = False
+    prompt_edit_text: str = ""
+    prompt_edit_status: str = "Press P to edit the seed prompt."
 
 
 @dataclass(frozen=True)
@@ -466,11 +475,6 @@ class MagentaController:
         topk: int,
         guidance_weight: float,
     ) -> None:
-        seed_prompt = " ".join((seed_prompt or "").strip().split())
-        if not seed_prompt:
-            raise ValueError("Seed prompt is required.")
-
-        self.seed_prompt = seed_prompt
         self.skip_nearest = int(skip_nearest)
         self.server_url = self._normalize_server_url(server_url)
         self.player_control_url = self._normalize_optional_url(player_control_url)
@@ -486,20 +490,12 @@ class MagentaController:
             topk=topk,
             guidance_weight=guidance_weight,
         )
-        self.seed_tokens = self._tokenize_style_text(self.seed_prompt)
-        self.row_labels = ["Orig"] + [f"Alt {index}" for index in range(1, GRID_ROWS)]
-        self.row_prompts = [self.seed_prompt] + [
-            (
-                f"Per-column cosine neighbor rank "
-                f"{self.skip_nearest + index}"
-            )
-            for index in range(1, GRID_ROWS)
-        ]
-        self.row_style_tokens = build_neighbor_row_style_tokens(
-            self.seed_tokens,
-            self.normalized_token_banks,
-            skip_nearest=self.skip_nearest,
-        )
+        self.seed_prompt = ""
+        self.seed_tokens: List[int] = []
+        self.row_labels: List[str] = []
+        self.row_prompts: List[str] = []
+        self.row_style_tokens: List[List[int]] = []
+        self.reseed_prompt(seed_prompt)
         self.current_style_tokens: List[int] = list(self.row_style_tokens[DEFAULT_ROW_INDEX])
         self._latest_status = "server control idle"
         self._refresh_player_control_mode()
@@ -616,6 +612,31 @@ class MagentaController:
             "seed": None,
         }
 
+    @staticmethod
+    def _normalize_prompt_text(prompt: str) -> str:
+        normalized_prompt = " ".join((prompt or "").strip().split())
+        if not normalized_prompt:
+            raise ValueError("Seed prompt is required.")
+        return normalized_prompt
+
+    def _build_seed_prompt_state(
+        self,
+        prompt: str,
+    ) -> tuple[str, List[int], List[str], List[str], List[List[int]]]:
+        normalized_prompt = self._normalize_prompt_text(prompt)
+        seed_tokens = self._tokenize_style_text(normalized_prompt)
+        row_labels = ["Orig"] + [f"Alt {index}" for index in range(1, GRID_ROWS)]
+        row_prompts = [normalized_prompt] + [
+            f"Per-column cosine neighbor rank {self.skip_nearest + index}"
+            for index in range(1, GRID_ROWS)
+        ]
+        row_style_tokens = build_neighbor_row_style_tokens(
+            seed_tokens,
+            self.normalized_token_banks,
+            skip_nearest=self.skip_nearest,
+        )
+        return normalized_prompt, seed_tokens, row_labels, row_prompts, row_style_tokens
+
     def _tokenize_style_text(self, prompt: str) -> List[int]:
         stream_info = self.stream_info
         token_count = int(stream_info.get("style_token_count", GRID_COLUMNS))
@@ -636,6 +657,20 @@ class MagentaController:
                 f"Invalid /style_tokens response: expected {GRID_COLUMNS} tokens."
             )
         return [int(token) for token in response]
+
+    def reseed_prompt(self, prompt: str) -> None:
+        (
+            normalized_prompt,
+            seed_tokens,
+            row_labels,
+            row_prompts,
+            row_style_tokens,
+        ) = self._build_seed_prompt_state(prompt)
+        self.seed_prompt = normalized_prompt
+        self.seed_tokens = seed_tokens
+        self.row_labels = row_labels
+        self.row_prompts = row_prompts
+        self.row_style_tokens = row_style_tokens
 
     def _consume_control_response(
         self,
@@ -1204,6 +1239,17 @@ def _front_reset_button_rect(size: Size) -> pygame.Rect:
     )
 
 
+def _front_prompt_button_rect(size: Size) -> pygame.Rect:
+    reset_rect = _front_reset_button_rect(size)
+    gap = max(18, int(round(size[0] * 0.015)))
+    return pygame.Rect(
+        reset_rect.left - gap - reset_rect.width,
+        reset_rect.top,
+        reset_rect.width,
+        reset_rect.height,
+    )
+
+
 def _scale_rect_to_dest(
     rect: pygame.Rect,
     src_size: Size,
@@ -1232,6 +1278,43 @@ def _emulation_reset_button_hit(
     button_rect = _front_reset_button_rect(front_size)
     scaled_button_rect = _scale_rect_to_dest(button_rect, front_size, layout.front_rect)
     return scaled_button_rect.collidepoint(mouse_position)
+
+
+def _emulation_prompt_button_hit(
+    *,
+    layout: EmulationLayout,
+    front_size: Size,
+    mouse_position: Tuple[int, int],
+) -> bool:
+    if layout.front_rect is None:
+        return False
+    if not layout.front_rect.collidepoint(mouse_position):
+        return False
+    button_rect = _front_prompt_button_rect(front_size)
+    scaled_button_rect = _scale_rect_to_dest(button_rect, front_size, layout.front_rect)
+    return scaled_button_rect.collidepoint(mouse_position)
+
+
+def _wrap_text(
+    text: str,
+    font: pygame.font.Font,
+    max_width: int,
+) -> List[str]:
+    cleaned = " ".join((text or "").split())
+    if not cleaned:
+        return [""]
+    words = cleaned.split(" ")
+    lines: List[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if font.size(candidate)[0] <= max_width:
+            current = candidate
+            continue
+        lines.append(current)
+        current = word
+    lines.append(current)
+    return lines
 
 
 def create_floor_frame(size: Size, state: GridState) -> pygame.Surface:
@@ -1363,11 +1446,19 @@ def create_front_frame(
     )
     _render_text(
         surface,
+        state.prompt_edit_status,
+        row_font,
+        TEXT_ERROR if "failed" in state.prompt_edit_status.lower() else TEXT_MUTED,
+        left_pad,
+        top_pad + title_font.get_height() + subtitle_font.get_height() * 3 + 44,
+    )
+    _render_text(
+        surface,
         f"Live style tokens: {state.current_style_tokens}",
         subtitle_font,
         TEXT_ACCENT,
         left_pad,
-        top_pad + title_font.get_height() + subtitle_font.get_height() * 3 + 50,
+        top_pad + title_font.get_height() + subtitle_font.get_height() * 4 + 50,
     )
     if state.generation_kwargs:
         crossfade_samples = int(state.generation_kwargs.get("crossfade_samples", 0))
@@ -1387,7 +1478,7 @@ def create_front_frame(
             row_font,
             TEXT_MUTED,
             left_pad,
-            top_pad + title_font.get_height() + subtitle_font.get_height() * 4 + 58,
+            top_pad + title_font.get_height() + subtitle_font.get_height() * 5 + 58,
         )
     _render_text(
         surface,
@@ -1395,10 +1486,30 @@ def create_front_frame(
         subtitle_font,
         TEXT_MUTED,
         left_pad,
-        top_pad + title_font.get_height() + subtitle_font.get_height() * 5 + 70,
+        top_pad + title_font.get_height() + subtitle_font.get_height() * 6 + 70,
     )
 
     if show_reset_button:
+        prompt_button_rect = _front_prompt_button_rect(size)
+        pygame.draw.rect(surface, FRONT_BUTTON_FILL, prompt_button_rect, border_radius=16)
+        pygame.draw.rect(
+            surface,
+            FRONT_BUTTON_BORDER,
+            prompt_button_rect,
+            width=3,
+            border_radius=16,
+        )
+        prompt_label_surface = panel_title_font.render("Edit Seed Prompt", True, FRONT_BUTTON_TEXT)
+        prompt_label_rect = prompt_label_surface.get_rect(
+            center=(prompt_button_rect.centerx, prompt_button_rect.centery - 8)
+        )
+        surface.blit(prompt_label_surface, prompt_label_rect)
+        prompt_hint_surface = panel_status_font.render("Press P", True, FRONT_BUTTON_HINT)
+        prompt_hint_rect = prompt_hint_surface.get_rect(
+            center=(prompt_button_rect.centerx, prompt_button_rect.centery + 16)
+        )
+        surface.blit(prompt_hint_surface, prompt_hint_rect)
+
         reset_button_rect = _front_reset_button_rect(size)
         pygame.draw.rect(surface, FRONT_BUTTON_FILL, reset_button_rect, border_radius=16)
         pygame.draw.rect(
@@ -1419,7 +1530,7 @@ def create_front_frame(
         )
         surface.blit(reset_hint_surface, reset_hint_rect)
 
-    legend_top = top_pad + title_font.get_height() + subtitle_font.get_height() * 5 + 82
+    legend_top = top_pad + title_font.get_height() + subtitle_font.get_height() * 6 + 82
     legend_col_gap = int(round(width * 0.03))
     legend_col_width = int(round((width - left_pad * 2 - legend_col_gap) / 2))
     legend_row_height = row_font.get_height() * 2 + 16
@@ -1507,6 +1618,78 @@ def create_front_frame(
         center=(width // 2, height - int(round(height * 0.08)))
     )
     surface.blit(footer_surface, footer_rect)
+
+    if state.prompt_edit_active:
+        overlay = pygame.Surface(size, pygame.SRCALPHA)
+        overlay.fill(PROMPT_EDIT_OVERLAY)
+        surface.blit(overlay, (0, 0))
+
+        panel_rect = pygame.Rect(
+            max(32, int(round(width * 0.09))),
+            max(24, int(round(height * 0.12))),
+            min(width - 64, int(round(width * 0.82))),
+            min(height - 48, int(round(height * 0.44))),
+        )
+        pygame.draw.rect(
+            surface,
+            PROMPT_EDIT_PANEL_ACTIVE,
+            panel_rect,
+            border_radius=22,
+        )
+        pygame.draw.rect(
+            surface,
+            PROMPT_EDIT_PANEL_ACTIVE_BORDER,
+            panel_rect,
+            width=4,
+            border_radius=22,
+        )
+
+        header_y = panel_rect.top + 20
+        _render_text(
+            surface,
+            "Edit Seed Prompt",
+            panel_title_font,
+            TEXT_MAIN,
+            panel_rect.left + 24,
+            header_y,
+        )
+        _render_text(
+            surface,
+            "Enter applies and recomputes neighbors. Esc cancels. R resets context after you apply.",
+            row_font,
+            TEXT_MUTED,
+            panel_rect.left + 24,
+            header_y + panel_title_font.get_height() + 6,
+        )
+
+        editor_rect = pygame.Rect(
+            panel_rect.left + 20,
+            header_y + panel_title_font.get_height() + row_font.get_height() + 24,
+            panel_rect.width - 40,
+            panel_rect.height - panel_title_font.get_height() - row_font.get_height() - 68,
+        )
+        pygame.draw.rect(surface, PROMPT_EDIT_PANEL, editor_rect, border_radius=16)
+        pygame.draw.rect(
+            surface,
+            PROMPT_EDIT_PANEL_BORDER,
+            editor_rect,
+            width=2,
+            border_radius=16,
+        )
+
+        draft_prompt = state.prompt_edit_text if state.prompt_edit_text else state.prompt_bank_name
+        wrapped_lines = _wrap_text(f"{draft_prompt}|", row_font, editor_rect.width - 28)
+        text_y = editor_rect.top + 16
+        for line in wrapped_lines[:6]:
+            _render_text(
+                surface,
+                line,
+                row_font,
+                TEXT_MAIN,
+                editor_rect.left + 14,
+                text_y,
+            )
+            text_y += row_font.get_height() + 6
     return surface
 
 
@@ -1822,6 +2005,52 @@ def _sync_magenta_tokens(
     return True
 
 
+def _load_seed_prompt_state(
+    state: GridState,
+    magenta_controller: MagentaController,
+) -> None:
+    state.prompt_bank_name = magenta_controller.seed_prompt
+    state.row_labels = list(magenta_controller.row_labels)
+    state.row_prompts = list(magenta_controller.row_prompts)
+    state.row_style_tokens = [
+        list(tokens) for tokens in magenta_controller.row_style_tokens
+    ]
+    state.grid_tokens = _build_token_columns(
+        state.row_style_tokens,
+    )
+
+
+def _start_prompt_edit(state: GridState) -> None:
+    state.prompt_edit_active = True
+    state.prompt_edit_text = state.prompt_bank_name
+    state.prompt_edit_status = "Editing seed prompt. Enter applies; Esc cancels."
+
+
+def _cancel_prompt_edit(state: GridState) -> None:
+    state.prompt_edit_active = False
+    state.prompt_edit_text = state.prompt_bank_name
+    state.prompt_edit_status = "Seed prompt edit canceled. Press P to edit again."
+
+
+def _apply_seed_prompt_edit(
+    state: GridState,
+    magenta_controller: MagentaController | None,
+) -> bool:
+    if magenta_controller is None:
+        state.prompt_edit_status = "Seed prompt update unavailable: no magenta controller."
+        return False
+    try:
+        magenta_controller.reseed_prompt(state.prompt_edit_text)
+        _load_seed_prompt_state(state, magenta_controller)
+        state.prompt_edit_text = state.prompt_bank_name
+        state.prompt_edit_active = False
+        state.prompt_edit_status = "Seed prompt updated. Press P to edit again."
+        return True
+    except Exception as exc:
+        state.prompt_edit_status = f"Seed prompt update failed: {exc}"
+        return False
+
+
 def _reset_magenta_context(
     state: GridState,
     magenta_controller: MagentaController | None,
@@ -1854,10 +2083,16 @@ def _visual_state_signature(state: GridState) -> Tuple[object, ...]:
         tuple(tuple(column) for column in state.grid_tokens),
         tuple(sorted(state.active_columns)),
         people_signature,
+        state.prompt_bank_name,
+        tuple(state.row_labels),
+        tuple(state.row_prompts),
         tuple(state.current_style_tokens),
         state.magenta_status,
         state.pose_status,
         state.people_count,
+        state.prompt_edit_active,
+        state.prompt_edit_text,
+        state.prompt_edit_status,
     )
 
 
@@ -1884,19 +2119,12 @@ def main() -> None:
             args,
             start_playback=not args.preview_only,
         )
-        state.prompt_bank_name = magenta_controller.seed_prompt
-        state.row_labels = list(magenta_controller.row_labels)
-        state.row_prompts = list(magenta_controller.row_prompts)
+        _load_seed_prompt_state(state, magenta_controller)
         state.magenta_server_url = magenta_controller.server_url
-        state.row_style_tokens = [
-            list(tokens) for tokens in magenta_controller.row_style_tokens
-        ]
         state.current_style_tokens = list(magenta_controller.current_style_tokens)
         state.generation_kwargs = dict(magenta_controller.generation_kwargs)
-        state.grid_tokens = _build_token_columns(
-            state.row_style_tokens,
-        )
         state.magenta_status = magenta_controller.status_text()
+        state.prompt_edit_text = state.prompt_bank_name
 
         if _apply_debug_people_if_any(state, args):
             _sync_magenta_tokens(state, magenta_controller)
@@ -1962,17 +2190,47 @@ def main() -> None:
         emulate_mouse_down = False
         emulate_click_position = None
         reset_requested = False
+        prompt_apply_requested = False
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT or (
                     event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
                 ):
+                    if state.prompt_edit_active:
+                        _cancel_prompt_edit(state)
+                        pygame.key.stop_text_input()
+                        continue
                     running = False
+                elif state.prompt_edit_active and event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        prompt_apply_requested = True
+                    elif event.key == pygame.K_BACKSPACE:
+                        state.prompt_edit_text = state.prompt_edit_text[:-1]
+                    elif event.key == pygame.K_ESCAPE:
+                        _cancel_prompt_edit(state)
+                        pygame.key.stop_text_input()
+                elif state.prompt_edit_active and event.type == pygame.TEXTINPUT:
+                    state.prompt_edit_text += event.text
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
                     reset_requested = True
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_p:
+                    _start_prompt_edit(state)
+                    pygame.key.start_text_input()
                 if args.emulate:
+                    if state.prompt_edit_active:
+                        continue
                     if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                         if (
+                            emulate_layout is not None
+                            and _emulation_prompt_button_hit(
+                                layout=emulate_layout,
+                                front_size=canvas_sizes[args.front_canvas],
+                                mouse_position=event.pos,
+                            )
+                        ):
+                            _start_prompt_edit(state)
+                            pygame.key.start_text_input()
+                        elif (
                             emulate_layout is not None
                             and _emulation_reset_button_hit(
                                 layout=emulate_layout,
@@ -1990,6 +2248,45 @@ def main() -> None:
             if reset_requested:
                 _reset_magenta_context(state, magenta_controller)
                 reset_requested = False
+
+            if prompt_apply_requested:
+                if _apply_seed_prompt_edit(state, magenta_controller):
+                    _sync_magenta_tokens(state, magenta_controller)
+                    pygame.key.stop_text_input()
+                prompt_apply_requested = False
+
+            if state.prompt_edit_active:
+                if magenta_controller is not None:
+                    magenta_controller.poll()
+                    state.magenta_status = magenta_controller.status_text()
+                visual_signature = _visual_state_signature(state)
+                if visual_signature != last_visual_signature:
+                    frames = build_frames(
+                        canvas_sizes,
+                        floor_canvas=floor_canvas,
+                        front_canvas=args.front_canvas,
+                        state=state,
+                        show_reset_button=args.emulate,
+                    )
+                    if args.emulate and emulate_window is not None and emulate_layout is not None:
+                        _render_emulation_window(
+                            emulate_window,
+                            emulate_layout,
+                            frames,
+                            floor_canvas=floor_canvas,
+                            front_canvas=args.front_canvas,
+                        )
+                    elif router is not None:
+                        router.render(
+                            frames,
+                            display=True,
+                            block=False,
+                            use_optimized=args.use_optimized,
+                            sync_display=True,
+                        )
+                    last_visual_signature = visual_signature
+                clock.tick(args.fps)
+                continue
 
             if args.emulate and emulate_layout is not None:
                 changed_columns = _apply_emulated_cursor(
@@ -2049,6 +2346,7 @@ def main() -> None:
                 last_visual_signature = visual_signature
             clock.tick(args.fps)
     finally:
+        pygame.key.stop_text_input()
         if pose_source is not None:
             pose_source.close()
         if magenta_controller is not None:
