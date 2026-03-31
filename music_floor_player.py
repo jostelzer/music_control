@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import inspect
 import math
 import os
 import signal
@@ -299,6 +300,46 @@ def _seconds_to_frames(seconds: float, frame_length_samples: int, sample_rate: i
     return int(math.ceil(seconds / frame_seconds))
 
 
+def _create_realtime_client(module, args):
+    client_cls = module.RealtimeClient
+    try:
+        parameters = set(inspect.signature(client_cls).parameters)
+    except (TypeError, ValueError):
+        parameters = {"server_url", "local_audio", "output_device"}
+
+    kwargs = {
+        "local_audio": not args.no_local_audio,
+        "output_device": args.output_device,
+    }
+    if "audio_backend" in parameters:
+        kwargs["audio_backend"] = args.audio_backend
+    elif args.audio_backend:
+        os.environ["MAGENTA_RT_AUDIO_BACKEND"] = str(args.audio_backend)
+        print(
+            "RealtimeClient does not accept --audio-backend directly; using "
+            "MAGENTA_RT_AUDIO_BACKEND fallback.",
+            file=sys.stderr,
+            flush=True,
+        )
+    if "audio_latency" in parameters:
+        kwargs["audio_latency"] = args.audio_latency
+    elif args.audio_latency is not None:
+        print(
+            "RealtimeClient does not support --audio-latency; ignoring.",
+            file=sys.stderr,
+            flush=True,
+        )
+    if "audio_blocksize" in parameters:
+        kwargs["audio_blocksize"] = args.audio_blocksize
+    elif args.audio_blocksize != DEFAULT_AUDIO_BLOCKSIZE:
+        print(
+            "RealtimeClient does not support --audio-blocksize; ignoring.",
+            file=sys.stderr,
+            flush=True,
+        )
+    return client_cls(args.magenta_server_url, **kwargs)
+
+
 def main() -> int:
     args = parse_args()
     if args.list_prompt_banks:
@@ -311,14 +352,7 @@ def main() -> int:
 
     try:
         module = _load_magenta_client_module()
-        client = module.RealtimeClient(
-            args.magenta_server_url,
-            local_audio=not args.no_local_audio,
-            output_device=args.output_device,
-            audio_backend=args.audio_backend,
-            audio_latency=args.audio_latency,
-            audio_blocksize=args.audio_blocksize,
-        )
+        client = _create_realtime_client(module, args)
 
         prompt_bank_name, prompt_rows = resolve_prompt_rows(
             prompt_bank=args.prompt_bank,
