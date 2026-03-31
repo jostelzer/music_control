@@ -23,9 +23,7 @@ if __package__ in (None, ""):
     if repo_root_str not in sys.path:
         sys.path.insert(0, repo_root_str)
 
-DEMO_DEFAULT_SEED_PROMPT = (
-    "minimal techno, berlin style, energizing, minimalistic, hypnotic"
-)
+DEMO_DEFAULT_SEED_PROMPT = "minimal techno"
 DEFAULT_TOKEN_BANK_PATH = REPO_ROOT / "token_embeddings" / "llm_large_style_token_banks.npy"
 DEFAULT_NEIGHBOR_SKIP = 0
 
