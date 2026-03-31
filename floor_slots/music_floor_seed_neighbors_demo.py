@@ -105,6 +105,11 @@ DEFAULT_POSE_PROTOCOL = "lucid"
 DEFAULT_LUCID_POSE_SERVICE = "pose3d-yolo26-pose-yolo26l"
 DEFAULT_LUCID_POSE_PORT = 8048
 DEFAULT_ZMQ_POSE_PORT = 5570
+DEFAULT_DECODE_WINDOW = 2
+DEFAULT_CROSSFADE_FRAMES = 1
+DEFAULT_TEMPERATURE = 1.1
+DEFAULT_TOPK = 40
+DEFAULT_GUIDANCE_WEIGHT = 5.0
 
 BLACK = (0, 0, 0)
 TEXT_MAIN = (235, 235, 235)
@@ -180,6 +185,7 @@ class GridState:
     prompt_bank_name: str = DEMO_DEFAULT_SEED_PROMPT
     magenta_server_url: str = DEFAULT_MAGENTA_SERVER_URL
     magenta_status: str = "magenta idle"
+    generation_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -451,6 +457,12 @@ class MagentaController:
         seed_prompt: str,
         token_bank_path: str,
         skip_nearest: int,
+        decode_window: int,
+        context_frames: int | None,
+        crossfade_frames: int,
+        temperature: float,
+        topk: int,
+        guidance_weight: float,
     ) -> None:
         seed_prompt = " ".join((seed_prompt or "").strip().split())
         if not seed_prompt:
@@ -461,6 +473,15 @@ class MagentaController:
         self.server_url = self._normalize_server_url(server_url)
         self.token_bank_path, self.token_banks = load_style_token_banks(token_bank_path)
         self.normalized_token_banks = _normalize_token_banks(self.token_banks)
+        self.stream_info = self._fetch_stream_info()
+        self.generation_kwargs = self._build_generation_kwargs(
+            decode_window=decode_window,
+            context_frames=context_frames,
+            crossfade_frames=crossfade_frames,
+            temperature=temperature,
+            topk=topk,
+            guidance_weight=guidance_weight,
+        )
         self.seed_tokens = self._tokenize_style_text(self.seed_prompt)
         self.row_labels = ["Orig"] + [f"Alt {index}" for index in range(1, GRID_ROWS)]
         self.row_prompts = [self.seed_prompt] + [
@@ -516,8 +537,48 @@ class MagentaController:
             raise RuntimeError(f"{method} {path} failed: {exc.reason}") from exc
         return json.loads(payload)
 
+    def _fetch_stream_info(self) -> Dict[str, Any]:
+        response = self._request_json("GET", "/stream_info")
+        if not isinstance(response, dict):
+            raise RuntimeError("Invalid /stream_info response: expected object.")
+        return response
+
+    def _build_generation_kwargs(
+        self,
+        *,
+        decode_window: int,
+        context_frames: int | None,
+        crossfade_frames: int,
+        temperature: float,
+        topk: int,
+        guidance_weight: float,
+    ) -> Dict[str, Any]:
+        stream_info = self.stream_info
+        frame_length_samples = int(stream_info.get("frame_length_samples", 1920))
+        max_decode_frames = max(1, int(stream_info.get("chunk_length_frames", 50)))
+        default_context_frames = int(stream_info.get("context_length_frames", 250))
+        min_context_frames = int(stream_info.get("min_context_length_frames", 25))
+        max_context_frames = int(stream_info.get("max_context_length_frames", default_context_frames))
+        max_crossfade_frames = int(stream_info.get("max_crossfade_length_frames", 5))
+        decode_value = max(1, min(int(round(decode_window)), max_decode_frames))
+        if context_frames is None:
+            context_value = default_context_frames
+        else:
+            context_value = int(round(context_frames))
+        context_value = max(min_context_frames, min(max_context_frames, context_value))
+        crossfade_value = max(0, min(int(round(crossfade_frames)), max_crossfade_frames))
+        return {
+            "max_decode_frames": decode_value,
+            "context_length_frames": context_value,
+            "crossfade_samples": crossfade_value * frame_length_samples,
+            "temperature": max(0.0, min(4.0, float(temperature))),
+            "topk": max(0, min(1024, int(round(topk)))),
+            "guidance_weight": max(0.0, min(10.0, float(guidance_weight))),
+            "seed": None,
+        }
+
     def _tokenize_style_text(self, prompt: str) -> List[int]:
-        stream_info = self._request_json("GET", "/stream_info")
+        stream_info = self.stream_info
         token_count = int(stream_info.get("style_token_count", GRID_COLUMNS))
         if token_count != GRID_COLUMNS:
             raise RuntimeError(
@@ -559,9 +620,12 @@ class MagentaController:
         response = self._request_json(
             "POST",
             "/control",
-            data=json.dumps({"style_tokens": [int(token) for token in style_tokens]}).encode(
-                "utf-8"
-            ),
+            data=json.dumps(
+                {
+                    "style_tokens": [int(token) for token in style_tokens],
+                    "generation_kwargs": dict(self.generation_kwargs),
+                }
+            ).encode("utf-8"),
             content_type="application/json",
         )
         self._consume_control_response(
@@ -578,7 +642,13 @@ class MagentaController:
         self._apply_control(tokens)
         return list(self.current_style_tokens)
 
-    def reset_context(self) -> List[int]:
+    def reset_context(self, style_tokens: List[int] | None = None) -> List[int]:
+        tokens = (
+            [int(token) for token in style_tokens]
+            if style_tokens is not None
+            else list(self.current_style_tokens)
+        )
+        self._apply_control(tokens)
         response = self._request_json(
             "POST",
             "/reset_context",
@@ -587,7 +657,7 @@ class MagentaController:
         )
         self._consume_control_response(
             response,
-            list(self.current_style_tokens),
+            tokens,
             status_prefix="context reset",
         )
         return list(self.current_style_tokens)
@@ -704,6 +774,42 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_NEIGHBOR_SKIP,
         help="Skip this many nearest neighbors before filling Alt rows.",
+    )
+    parser.add_argument(
+        "--decode-window",
+        type=int,
+        default=DEFAULT_DECODE_WINDOW,
+        help="Emit frames per step, aligned with the Gradio client default.",
+    )
+    parser.add_argument(
+        "--context-frames",
+        type=int,
+        default=None,
+        help="Context window in codec frames. Defaults to the server/Gradio default.",
+    )
+    parser.add_argument(
+        "--crossfade-frames",
+        type=int,
+        default=DEFAULT_CROSSFADE_FRAMES,
+        help="Crossfade size in codec frames, aligned with the Gradio client default.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=DEFAULT_TEMPERATURE,
+        help="Sampling temperature, aligned with the Gradio client default.",
+    )
+    parser.add_argument(
+        "--topk",
+        type=int,
+        default=DEFAULT_TOPK,
+        help="Top-k sampling cutoff, aligned with the Gradio client default.",
+    )
+    parser.add_argument(
+        "--guidance-weight",
+        type=float,
+        default=DEFAULT_GUIDANCE_WEIGHT,
+        help="Guidance weight, aligned with the Gradio client default.",
     )
     parser.add_argument(
         "--magenta-server-url",
@@ -1176,13 +1282,33 @@ def create_front_frame(
         left_pad,
         top_pad + title_font.get_height() + subtitle_font.get_height() * 3 + 50,
     )
+    if state.generation_kwargs:
+        crossfade_samples = int(state.generation_kwargs.get("crossfade_samples", 0))
+        crossfade_frames = int(round(crossfade_samples / 1920.0)) if crossfade_samples else 0
+        generation_label = (
+            "Gen: "
+            f"emit={int(state.generation_kwargs.get('max_decode_frames', 0))} "
+            f"ctx={int(state.generation_kwargs.get('context_length_frames', 0))} "
+            f"xfade={crossfade_frames} "
+            f"temp={float(state.generation_kwargs.get('temperature', 0.0)):.2f} "
+            f"topk={int(state.generation_kwargs.get('topk', 0))} "
+            f"guide={float(state.generation_kwargs.get('guidance_weight', 0.0)):.2f}"
+        )
+        _render_text(
+            surface,
+            generation_label,
+            row_font,
+            TEXT_MUTED,
+            left_pad,
+            top_pad + title_font.get_height() + subtitle_font.get_height() * 4 + 58,
+        )
     _render_text(
         surface,
         state.magenta_status,
         subtitle_font,
         TEXT_MUTED,
         left_pad,
-        top_pad + title_font.get_height() + subtitle_font.get_height() * 4 + 62,
+        top_pad + title_font.get_height() + subtitle_font.get_height() * 5 + 70,
     )
 
     if show_reset_button:
@@ -1422,6 +1548,7 @@ def save_previews(
         "row_prompts": state.row_prompts,
         "row_style_tokens": state.row_style_tokens,
         "current_style_tokens": state.current_style_tokens,
+        "generation_kwargs": state.generation_kwargs,
         "magenta_server_url": state.magenta_server_url,
         "magenta_status": state.magenta_status,
         "active_columns": sorted(column + 1 for column in state.active_columns),
@@ -1458,6 +1585,12 @@ def _connect_magenta_controller(
             seed_prompt=args.music_prompt or args.seed_prompt,
             token_bank_path=args.token_bank_path,
             skip_nearest=args.skip_nearest,
+            decode_window=args.decode_window,
+            context_frames=args.context_frames,
+            crossfade_frames=args.crossfade_frames,
+            temperature=args.temperature,
+            topk=args.topk,
+            guidance_weight=args.guidance_weight,
         )
     except Exception as exc:
         raise SystemExit(f"Could not start Magenta control: {exc}") from exc
@@ -1609,7 +1742,9 @@ def _reset_magenta_context(
         state.magenta_status = "context reset unavailable: no magenta controller"
         return
     try:
-        state.current_style_tokens = list(magenta_controller.reset_context())
+        state.current_style_tokens = list(
+            magenta_controller.reset_context(_selected_style_tokens(state))
+        )
         state.magenta_status = magenta_controller.status_text()
     except Exception as exc:
         state.magenta_status = f"context reset failed: {exc}"
@@ -1669,6 +1804,7 @@ def main() -> None:
             list(tokens) for tokens in magenta_controller.row_style_tokens
         ]
         state.current_style_tokens = list(magenta_controller.current_style_tokens)
+        state.generation_kwargs = dict(magenta_controller.generation_kwargs)
         state.grid_tokens = _build_token_columns(
             state.row_style_tokens,
         )

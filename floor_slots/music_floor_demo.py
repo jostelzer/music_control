@@ -474,7 +474,13 @@ class MagentaController:
         self._apply_control(tokens)
         return list(self.current_style_tokens)
 
-    def reset_context(self) -> List[int]:
+    def reset_context(self, style_tokens: List[int] | None = None) -> List[int]:
+        tokens = (
+            [int(token) for token in style_tokens]
+            if style_tokens is not None
+            else list(self.current_style_tokens)
+        )
+        self._apply_control(tokens)
         response = self._request_json(
             "POST",
             "/reset_context",
@@ -483,7 +489,7 @@ class MagentaController:
         )
         self._consume_control_response(
             response,
-            list(self.current_style_tokens),
+            tokens,
             status_prefix="context reset",
         )
         return list(self.current_style_tokens)
@@ -1514,7 +1520,9 @@ def _reset_magenta_context(
         state.magenta_status = "context reset unavailable: no magenta controller"
         return
     try:
-        state.current_style_tokens = list(magenta_controller.reset_context())
+        state.current_style_tokens = list(
+            magenta_controller.reset_context(_selected_style_tokens(state))
+        )
         state.magenta_status = magenta_controller.status_text()
     except Exception as exc:
         state.magenta_status = f"context reset failed: {exc}"
