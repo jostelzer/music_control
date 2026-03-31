@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import inspect
+import json
 import math
 import os
 import signal
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from floor_slots.music_floor_prompt_banks import (
@@ -31,6 +33,8 @@ DEFAULT_MAX_BUFFER_FRAMES = 12
 DEFAULT_ADAPTIVE_PLAYBACK = False
 DEFAULT_AUDIO_BLOCKSIZE = 0
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 3.0
+DEFAULT_CONTROL_HOST = "127.0.0.1"
+DEFAULT_CONTROL_PORT = 8014
 
 _MAGENTA_CLIENT_MODULE = None
 
@@ -116,6 +120,197 @@ class _ShutdownController:
             return
         self._force_exit_cancel.set()
         self._force_exit_cancel = None
+
+
+class _PlayerSessionBridge:
+    def __init__(
+        self,
+        client,
+        *,
+        style_text: str,
+        style_tokens: list[int],
+        style_source: str,
+        generation_kwargs: dict[str, object],
+        adaptive_playback: bool,
+        target_buffer_frames: int,
+        max_buffer_frames: int,
+    ) -> None:
+        self._client = client
+        self._lock = threading.RLock()
+        self._style_text = str(style_text)
+        self._style_tokens = [int(token) for token in style_tokens]
+        self._style_source = str(style_source)
+        self._generation_kwargs = dict(generation_kwargs)
+        self._adaptive_playback = bool(adaptive_playback)
+        self._target_buffer_frames = int(target_buffer_frames)
+        self._max_buffer_frames = int(max_buffer_frames)
+
+    def _snapshot_locked(self) -> dict[str, object]:
+        playback_state = str(getattr(self._client, "playback_state", "unknown"))
+        status_text_fn = getattr(self._client, "status_text", None)
+        if callable(status_text_fn):
+            status_text = str(status_text_fn())
+        else:
+            status_text = playback_state
+        return {
+            "status": "ok",
+            "server_url": str(getattr(self._client, "server_url", "")),
+            "style_text": self._style_text,
+            "style_source": self._style_source,
+            "style_tokens": list(self._style_tokens),
+            "generation_kwargs": dict(self._generation_kwargs),
+            "adaptive_playback": self._adaptive_playback,
+            "target_buffer_frames": self._target_buffer_frames,
+            "max_buffer_frames": self._max_buffer_frames,
+            "session_is_active": playback_state != "STOPPED",
+            "playback_state": playback_state,
+            "status_text": status_text,
+        }
+
+    @staticmethod
+    def _coerce_style_tokens(raw_tokens) -> list[int]:
+        if not isinstance(raw_tokens, (list, tuple)):
+            raise ValueError("style_tokens must be a list of integers.")
+        return [int(round(float(token))) for token in raw_tokens]
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return self._snapshot_locked()
+
+    def update_style_tokens(
+        self,
+        style_tokens,
+        *,
+        style_text: str | None = None,
+        style_source: str = "manual",
+    ) -> dict[str, object]:
+        tokens = self._coerce_style_tokens(style_tokens)
+        text = self._style_text if style_text is None else str(style_text).strip() or self._style_text
+        source = str(style_source).strip() or "manual"
+        with self._lock:
+            returned_tokens = list(
+                self._client.update_style_tokens(
+                    tokens,
+                    style_text=text,
+                    style_source=source,
+                )
+            )
+            self._style_text = text
+            self._style_source = source
+            self._style_tokens = returned_tokens
+            return self._snapshot_locked()
+
+    def reset_session(
+        self,
+        style_tokens,
+        *,
+        style_text: str | None = None,
+        style_source: str = "manual",
+    ) -> dict[str, object]:
+        tokens = self._coerce_style_tokens(style_tokens)
+        text = self._style_text if style_text is None else str(style_text).strip() or self._style_text
+        source = str(style_source).strip() or "manual"
+        with self._lock:
+            self._client.reset_session(
+                style_text=text,
+                style_tokens=tokens,
+                style_source=source,
+                generation_kwargs=dict(self._generation_kwargs),
+                adaptive_playback=self._adaptive_playback,
+                target_buffer_frames=self._target_buffer_frames,
+                max_buffer_frames=self._max_buffer_frames,
+            )
+            self._style_text = text
+            self._style_source = source
+            current_tokens = getattr(self._client, "_current_style_tokens", tokens)
+            self._style_tokens = [int(token) for token in current_tokens]
+            return self._snapshot_locked()
+
+
+def _build_player_control_handler(bridge: _PlayerSessionBridge):
+    class _PlayerControlHandler(BaseHTTPRequestHandler):
+        server_version = "MusicFloorPlayerControl/1.0"
+
+        def log_message(self, format: str, *args) -> None:  # noqa: A003
+            return None
+
+        def _send_json(self, status_code: int, payload: dict[str, object]) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _read_json_body(self) -> dict[str, object]:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            if length <= 0:
+                return {}
+            raw = self.rfile.read(length)
+            if not raw:
+                return {}
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("Expected JSON object body.")
+            return payload
+
+        def do_GET(self) -> None:
+            if self.path != "/state":
+                self._send_json(404, {"status": "error", "error": "not found"})
+                return
+            self._send_json(200, bridge.snapshot())
+
+        def do_POST(self) -> None:
+            try:
+                payload = self._read_json_body()
+                if self.path == "/update_style_tokens":
+                    response = bridge.update_style_tokens(
+                        payload.get("style_tokens"),
+                        style_text=payload.get("style_text"),
+                        style_source=str(payload.get("style_source") or "manual"),
+                    )
+                    self._send_json(200, response)
+                    return
+                if self.path == "/reset_session":
+                    response = bridge.reset_session(
+                        payload.get("style_tokens"),
+                        style_text=payload.get("style_text"),
+                        style_source=str(payload.get("style_source") or "manual"),
+                    )
+                    self._send_json(200, response)
+                    return
+                if self.path == "/state":
+                    self._send_json(200, bridge.snapshot())
+                    return
+                self._send_json(404, {"status": "error", "error": "not found"})
+            except Exception as exc:
+                self._send_json(400, {"status": "error", "error": str(exc)})
+
+    return _PlayerControlHandler
+
+
+class _PlayerControlServer:
+    def __init__(self, host: str, port: int, bridge: _PlayerSessionBridge) -> None:
+        self._server = ThreadingHTTPServer((host, int(port)), _build_player_control_handler(bridge))
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            name="music-floor-player-control",
+            daemon=True,
+        )
+
+    @property
+    def url(self) -> str:
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2.0)
 
 
 def _load_magenta_client_module():
@@ -289,6 +484,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_AUDIO_BLOCKSIZE,
         help="sounddevice blocksize for local audio playback. Use 0 to let the backend choose.",
     )
+    parser.add_argument(
+        "--control-host",
+        type=str,
+        default=DEFAULT_CONTROL_HOST,
+        help="Host for the local floor-control API exposed by this player.",
+    )
+    parser.add_argument(
+        "--control-port",
+        type=int,
+        default=DEFAULT_CONTROL_PORT,
+        help="Port for the local floor-control API. Use 0 to disable it.",
+    )
     return parser.parse_args()
 
 
@@ -382,6 +589,7 @@ def main() -> int:
     shutdown = _ShutdownController(DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
     shutdown.install()
     client = None
+    control_server = None
 
     try:
         module = _load_magenta_client_module()
@@ -469,11 +677,31 @@ def main() -> int:
             max_buffer_frames=max_buffer_frames,
         )
 
+        if args.control_port > 0:
+            control_bridge = _PlayerSessionBridge(
+                client,
+                style_text=startup_style_text,
+                style_tokens=tokens,
+                style_source="prompt" if startup_style_source == "prompt" else "manual",
+                generation_kwargs=generation_kwargs,
+                adaptive_playback=args.adaptive_playback,
+                target_buffer_frames=target_buffer_frames,
+                max_buffer_frames=max_buffer_frames,
+            )
+            control_server = _PlayerControlServer(
+                args.control_host,
+                args.control_port,
+                control_bridge,
+            )
+            control_server.start()
+
         print(f"server={client.server_url}", flush=True)
         print(f"prompt_bank={prompt_bank_name}", flush=True)
         print(f"startup_style_source={startup_style_source}", flush=True)
         print(f"prompt={startup_style_text}", flush=True)
         print(f"style_tokens={tokens}", flush=True)
+        if control_server is not None:
+            print(f"control_url={control_server.url}", flush=True)
         print(
             "generation="
             f"emit_frames={active_decode_frames} "
@@ -516,10 +744,14 @@ def main() -> int:
         shutdown.request_stop(130, "Keyboard interrupt received. Stopping player...")
     finally:
         try:
-            if client is not None:
-                client.stop_session()
+            if control_server is not None:
+                control_server.close()
         finally:
-            shutdown.finish()
+            try:
+                if client is not None:
+                    client.stop_session()
+            finally:
+                shutdown.finish()
 
     return shutdown.exit_code
 

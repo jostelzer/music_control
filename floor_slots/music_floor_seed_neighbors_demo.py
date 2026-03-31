@@ -101,6 +101,7 @@ DEFAULT_ROW_INDEX = STYLE_ROW_INDEX
 STYLE_TOKEN_MIN = 0
 STYLE_TOKEN_MAX = 1023
 DEFAULT_MAGENTA_SERVER_URL = "http://graciosa:8013"
+DEFAULT_PLAYER_CONTROL_URL = "http://127.0.0.1:8014"
 DEFAULT_POSE_PROTOCOL = "lucid"
 DEFAULT_LUCID_POSE_SERVICE = "pose3d-yolo26-pose-yolo26l"
 DEFAULT_LUCID_POSE_PORT = 8048
@@ -454,6 +455,7 @@ class MagentaController:
     def __init__(
         self,
         server_url: str,
+        player_control_url: str | None,
         seed_prompt: str,
         token_bank_path: str,
         skip_nearest: int,
@@ -471,6 +473,8 @@ class MagentaController:
         self.seed_prompt = seed_prompt
         self.skip_nearest = int(skip_nearest)
         self.server_url = self._normalize_server_url(server_url)
+        self.player_control_url = self._normalize_optional_url(player_control_url)
+        self._use_player_control = False
         self.token_bank_path, self.token_banks = load_style_token_banks(token_bank_path)
         self.normalized_token_banks = _normalize_token_banks(self.token_banks)
         self.stream_info = self._fetch_stream_info()
@@ -498,6 +502,7 @@ class MagentaController:
         )
         self.current_style_tokens: List[int] = list(self.row_style_tokens[DEFAULT_ROW_INDEX])
         self._latest_status = "server control idle"
+        self._refresh_player_control_mode()
         self._apply_control(self.current_style_tokens)
 
     @staticmethod
@@ -510,6 +515,15 @@ class MagentaController:
             raise ValueError("Magenta server URL must start with http:// or https://")
         return url
 
+    @classmethod
+    def _normalize_optional_url(cls, server_url: str | None) -> str | None:
+        if server_url is None:
+            return None
+        text = (server_url or "").strip()
+        if not text:
+            return None
+        return cls._normalize_server_url(text)
+
     def _request_json(
         self,
         method: str,
@@ -517,12 +531,13 @@ class MagentaController:
         *,
         data: bytes | None = None,
         content_type: str | None = None,
+        base_url: str | None = None,
     ):
         headers = {}
         if content_type is not None:
             headers["Content-Type"] = content_type
         request = urllib_request.Request(
-            f"{self.server_url}{path}",
+            f"{base_url or self.server_url}{path}",
             data=data,
             headers=headers,
             method=method,
@@ -536,6 +551,30 @@ class MagentaController:
         except urllib_error.URLError as exc:
             raise RuntimeError(f"{method} {path} failed: {exc.reason}") from exc
         return json.loads(payload)
+
+    def _refresh_player_control_mode(self) -> None:
+        if self.player_control_url is None or self._use_player_control:
+            return
+        try:
+            response = self._request_json(
+                "GET",
+                "/state",
+                base_url=self.player_control_url,
+            )
+        except Exception:
+            return
+        if not isinstance(response, dict):
+            return
+        response_server_url = str(response.get("server_url") or "").strip()
+        if response_server_url:
+            self.server_url = self._normalize_server_url(response_server_url)
+        response_generation_kwargs = response.get("generation_kwargs")
+        if isinstance(response_generation_kwargs, dict):
+            self.generation_kwargs = dict(response_generation_kwargs)
+        status_text = str(response.get("status_text") or "").strip()
+        if status_text:
+            self._latest_status = status_text
+        self._use_player_control = True
 
     def _fetch_stream_info(self) -> Dict[str, Any]:
         response = self._request_json("GET", "/stream_info")
@@ -609,6 +648,13 @@ class MagentaController:
             self.current_style_tokens = [int(token) for token in response["style_tokens"]]
         else:
             self.current_style_tokens = [int(token) for token in fallback_tokens]
+        if isinstance(response, dict) and isinstance(response.get("generation_kwargs"), dict):
+            self.generation_kwargs = dict(response["generation_kwargs"])
+        if isinstance(response, dict):
+            status_text = str(response.get("status_text") or "").strip()
+            if status_text:
+                self._latest_status = status_text
+                return
         session_is_active = bool(response.get("session_is_active")) if isinstance(response, dict) else False
         playback_state = str(response.get("playback_state") or "unknown") if isinstance(response, dict) else "unknown"
         session_text = "session active" if session_is_active else "no player session"
@@ -617,21 +663,38 @@ class MagentaController:
         )
 
     def _apply_control(self, style_tokens: List[int]) -> None:
-        response = self._request_json(
-            "POST",
-            "/control",
-            data=json.dumps(
-                {
-                    "style_tokens": [int(token) for token in style_tokens],
-                    "generation_kwargs": dict(self.generation_kwargs),
-                }
-            ).encode("utf-8"),
-            content_type="application/json",
-        )
+        self._refresh_player_control_mode()
+        payload = {
+            "style_tokens": [int(token) for token in style_tokens],
+            "style_text": self.seed_prompt,
+            "style_source": "manual",
+        }
+        if self._use_player_control and self.player_control_url is not None:
+            response = self._request_json(
+                "POST",
+                "/update_style_tokens",
+                data=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+                base_url=self.player_control_url,
+            )
+            status_prefix = "player control"
+        else:
+            response = self._request_json(
+                "POST",
+                "/control",
+                data=json.dumps(
+                    {
+                        "style_tokens": [int(token) for token in style_tokens],
+                        "generation_kwargs": dict(self.generation_kwargs),
+                    }
+                ).encode("utf-8"),
+                content_type="application/json",
+            )
+            status_prefix = "server control"
         self._consume_control_response(
             response,
             [int(token) for token in style_tokens],
-            status_prefix="server control",
+            status_prefix=status_prefix,
         )
 
     def poll(self) -> None:
@@ -648,17 +711,35 @@ class MagentaController:
             if style_tokens is not None
             else list(self.current_style_tokens)
         )
-        self._apply_control(tokens)
-        response = self._request_json(
-            "POST",
-            "/reset_context",
-            data=b"{}",
-            content_type="application/json",
-        )
+        self._refresh_player_control_mode()
+        if self._use_player_control and self.player_control_url is not None:
+            response = self._request_json(
+                "POST",
+                "/reset_session",
+                data=json.dumps(
+                    {
+                        "style_tokens": tokens,
+                        "style_text": self.seed_prompt,
+                        "style_source": "manual",
+                    }
+                ).encode("utf-8"),
+                content_type="application/json",
+                base_url=self.player_control_url,
+            )
+            status_prefix = "player reset"
+        else:
+            self._apply_control(tokens)
+            response = self._request_json(
+                "POST",
+                "/reset_context",
+                data=b"{}",
+                content_type="application/json",
+            )
+            status_prefix = "context reset"
         self._consume_control_response(
             response,
             tokens,
-            status_prefix="context reset",
+            status_prefix=status_prefix,
         )
         return list(self.current_style_tokens)
 
@@ -810,6 +891,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_GUIDANCE_WEIGHT,
         help="Guidance weight, aligned with the Gradio client default.",
+    )
+    parser.add_argument(
+        "--player-control-url",
+        type=str,
+        default=DEFAULT_PLAYER_CONTROL_URL,
+        help="Local music_floor_player control URL. Empty string disables it and falls back to direct server control.",
     )
     parser.add_argument(
         "--magenta-server-url",
@@ -1582,6 +1669,7 @@ def _connect_magenta_controller(
     try:
         return MagentaController(
             server_url=args.magenta_server_url,
+            player_control_url=args.player_control_url,
             seed_prompt=args.music_prompt or args.seed_prompt,
             token_bank_path=args.token_bank_path,
             skip_nearest=args.skip_nearest,
