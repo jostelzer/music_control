@@ -300,6 +300,31 @@ def _seconds_to_frames(seconds: float, frame_length_samples: int, sample_rate: i
     return int(math.ceil(seconds / frame_seconds))
 
 
+def _prompt_was_explicitly_requested(args: argparse.Namespace) -> bool:
+    if args.prompt_file or args.music_prompt:
+        return True
+    if any((prompt or "").strip() for prompt in args.row_prompt):
+        return True
+    return any(
+        token == "--prompt-bank" or token.startswith("--prompt-bank=")
+        for token in sys.argv[1:]
+    )
+
+
+def _fetch_existing_style_tokens(client) -> list[int] | None:
+    request_json = getattr(client, "_request_json", None)
+    if not callable(request_json):
+        return None
+    response = request_json("POST", "/control", json={})
+    tokens = response.get("style_tokens") if isinstance(response, dict) else None
+    if not isinstance(tokens, list):
+        return None
+    try:
+        return [int(token) for token in tokens]
+    except (TypeError, ValueError):
+        return None
+
+
 def _create_realtime_client(module, args):
     client_cls = module.RealtimeClient
     try:
@@ -361,8 +386,27 @@ def main() -> int:
             legacy_music_prompt=args.music_prompt,
         )
         client.refresh_stream_info()
+        prompt_requested = _prompt_was_explicitly_requested(args)
         prompt = prompt_rows[0].prompt
-        tokens = list(client.update_style(prompt))
+        startup_style_source = "prompt"
+        startup_style_text = prompt
+        tokens = None
+        if not prompt_requested:
+            try:
+                existing_tokens = _fetch_existing_style_tokens(client)
+            except Exception as exc:
+                existing_tokens = None
+                print(
+                    f"Could not fetch existing server style tokens: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if existing_tokens:
+                tokens = list(existing_tokens)
+                startup_style_source = "preserved"
+                startup_style_text = "preserved server style"
+        if tokens is None:
+            tokens = list(client.update_style(prompt))
         generation_kwargs = module._build_generation_kwargs(
             client,
             decode_window=args.decode_window,
@@ -391,9 +435,9 @@ def main() -> int:
             )
 
         client.start_session(
-            style_text=prompt,
+            style_text=startup_style_text,
             style_tokens=tokens,
-            style_source="prompt",
+            style_source="prompt" if startup_style_source == "prompt" else "manual",
             generation_kwargs=generation_kwargs,
             adaptive_playback=args.adaptive_playback,
             target_buffer_frames=target_buffer_frames,
@@ -402,7 +446,8 @@ def main() -> int:
 
         print(f"server={client.server_url}", flush=True)
         print(f"prompt_bank={prompt_bank_name}", flush=True)
-        print(f"prompt={prompt}", flush=True)
+        print(f"startup_style_source={startup_style_source}", flush=True)
+        print(f"prompt={startup_style_text}", flush=True)
         print(f"style_tokens={tokens}", flush=True)
         if args.status_interval > 0:
             print(client.status_text(), flush=True)
