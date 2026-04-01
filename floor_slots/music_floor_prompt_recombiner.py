@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -218,11 +220,28 @@ class PromptRecombinerController:
         self.server_url = self._normalize_server_url(server_url)
         self.player_control_url = self._normalize_optional_url(player_control_url)
         self._use_player_control = False
+        self._state_lock = threading.RLock()
+        self._tokenization_event = threading.Event()
+        self._tokenization_thread: threading.Thread | None = None
+        self._shutdown = False
+        self._requested_prompt_id = 0
+        self._applied_prompt_id = 0
+        self._applied_prompt_text = ""
+        self._tokenizing_prompt_id: int | None = None
+        self._tokenizing_prompt_text: str | None = None
+        self._ready_prompt_id: int | None = None
+        self._ready_prompt_text: str | None = None
+        self._ready_prompt_tokens: List[int] | None = None
+        self._pending_error: str | None = None
         self.current_prompt_text = self._normalize_prompt(initial_prompt)
         self.current_style_tokens = self._tokenize_style_text(self.current_prompt_text)
+        self._token_cache: Dict[str, List[int]] = {
+            self.current_prompt_text: list(self.current_style_tokens)
+        }
         self._latest_status = "server control idle"
         self._refresh_player_control_mode()
         self._apply_prompt(self.current_prompt_text, self.current_style_tokens)
+        self._applied_prompt_text = self.current_prompt_text
 
     @staticmethod
     def _normalize_prompt(prompt: str) -> str:
@@ -348,6 +367,61 @@ class PromptRecombinerController:
             f"{status_prefix} {session_text} | playback={playback_state.lower()} @ {self.server_url}"
         )
 
+    def _ensure_tokenization_worker(self) -> None:
+        with self._state_lock:
+            if self._tokenization_thread is not None and self._tokenization_thread.is_alive():
+                return
+            self._tokenization_thread = threading.Thread(
+                target=self._tokenization_worker_main,
+                name="prompt-recombiner-tokenize",
+                daemon=True,
+            )
+            self._tokenization_thread.start()
+
+    def _tokenization_worker_main(self) -> None:
+        while True:
+            self._tokenization_event.wait()
+            with self._state_lock:
+                if self._shutdown:
+                    return
+                prompt = self.current_prompt_text
+                request_id = self._requested_prompt_id
+                self._tokenization_event.clear()
+                cached_tokens = self._token_cache.get(prompt)
+                if cached_tokens is not None:
+                    self._ready_prompt_id = request_id
+                    self._ready_prompt_text = prompt
+                    self._ready_prompt_tokens = list(cached_tokens)
+                    continue
+                self._tokenizing_prompt_id = request_id
+                self._tokenizing_prompt_text = prompt
+
+            try:
+                tokens = self._tokenize_style_text(prompt)
+            except Exception as exc:
+                with self._state_lock:
+                    if self._shutdown:
+                        return
+                    if self._tokenizing_prompt_id == request_id:
+                        self._tokenizing_prompt_id = None
+                        self._tokenizing_prompt_text = None
+                    if request_id == self._requested_prompt_id and prompt == self.current_prompt_text:
+                        self._pending_error = f"prompt tokenization failed: {exc}"
+                continue
+
+            with self._state_lock:
+                if self._shutdown:
+                    return
+                self._token_cache[prompt] = [int(token) for token in tokens]
+                if self._tokenizing_prompt_id == request_id:
+                    self._tokenizing_prompt_id = None
+                    self._tokenizing_prompt_text = None
+                if request_id == self._requested_prompt_id and prompt == self.current_prompt_text:
+                    self._ready_prompt_id = request_id
+                    self._ready_prompt_text = prompt
+                    self._ready_prompt_tokens = [int(token) for token in tokens]
+                    self._pending_error = None
+
     def _apply_prompt(
         self,
         prompt_text: str,
@@ -401,21 +475,138 @@ class PromptRecombinerController:
         )
 
     def poll(self) -> None:
-        return None
+        ready_result = None
+        with self._state_lock:
+            if self._ready_prompt_text is not None and self._ready_prompt_tokens is not None:
+                ready_result = (
+                    int(self._ready_prompt_id or 0),
+                    self._ready_prompt_text,
+                    list(self._ready_prompt_tokens),
+                )
+                self._ready_prompt_id = None
+                self._ready_prompt_text = None
+                self._ready_prompt_tokens = None
+        if ready_result is None:
+            return
+
+        request_id, prompt, tokens = ready_result
+        try:
+            self._apply_prompt(prompt, tokens)
+        except Exception as exc:
+            with self._state_lock:
+                if request_id == self._requested_prompt_id and prompt == self.current_prompt_text:
+                    self._pending_error = f"prompt apply failed: {exc}"
+            return
+
+        with self._state_lock:
+            self._applied_prompt_id = request_id
+            self._applied_prompt_text = prompt
+            self._pending_error = None
 
     def update_prompt(self, prompt_text: str) -> List[int]:
-        self._apply_prompt(prompt_text)
+        prompt = self._normalize_prompt(prompt_text)
+        with self._state_lock:
+            if (
+                prompt == self.current_prompt_text
+                and self._requested_prompt_id == self._applied_prompt_id
+                and self._pending_error is None
+            ):
+                return list(self.current_style_tokens)
+            self.current_prompt_text = prompt
+            self._requested_prompt_id += 1
+            request_id = self._requested_prompt_id
+            cached_tokens = self._token_cache.get(prompt)
+            self._pending_error = None
+            self._ready_prompt_id = None
+            self._ready_prompt_text = None
+            self._ready_prompt_tokens = None
+
+        if cached_tokens is not None:
+            try:
+                self._apply_prompt(prompt, cached_tokens)
+            except Exception as exc:
+                with self._state_lock:
+                    if request_id == self._requested_prompt_id and prompt == self.current_prompt_text:
+                        self._pending_error = f"prompt apply failed: {exc}"
+                return list(self.current_style_tokens)
+            with self._state_lock:
+                self._applied_prompt_id = request_id
+                self._applied_prompt_text = prompt
+                self._pending_error = None
+            return list(self.current_style_tokens)
+
+        self._ensure_tokenization_worker()
+        self._tokenization_event.set()
         return list(self.current_style_tokens)
 
     def reset_context(self, prompt_text: str | None = None) -> List[int]:
-        prompt = self.current_prompt_text if prompt_text is None else prompt_text
-        self._apply_prompt(prompt, reset_context=True)
+        prompt = self.current_prompt_text if prompt_text is None else self._normalize_prompt(prompt_text)
+        with self._state_lock:
+            self.current_prompt_text = prompt
+            self._requested_prompt_id += 1
+            request_id = self._requested_prompt_id
+            self._ready_prompt_id = None
+            self._ready_prompt_text = None
+            self._ready_prompt_tokens = None
+            self._pending_error = None
+            cached_tokens = self._token_cache.get(prompt)
+
+        if cached_tokens is None:
+            cached_tokens = self._tokenize_style_text(prompt)
+            with self._state_lock:
+                self._token_cache[prompt] = list(cached_tokens)
+
+        self._apply_prompt(prompt, cached_tokens, reset_context=True)
+        with self._state_lock:
+            self._applied_prompt_id = request_id
+            self._applied_prompt_text = prompt
+            self._pending_error = None
         return list(self.current_style_tokens)
 
+    def has_pending_prompt_update(self) -> bool:
+        with self._state_lock:
+            return (
+                self._pending_error is None
+                and self._requested_prompt_id != self._applied_prompt_id
+            )
+
+    def flush_pending_updates(self, timeout_seconds: float = 30.0) -> None:
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while True:
+            self.poll()
+            with self._state_lock:
+                pending_error = self._pending_error
+                is_pending = (
+                    pending_error is None
+                    and self._requested_prompt_id != self._applied_prompt_id
+                )
+            if pending_error is not None:
+                raise RuntimeError(pending_error)
+            if not is_pending:
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out after {timeout_seconds:.1f}s waiting for prompt tokenization."
+                )
+            time.sleep(0.01)
+
     def status_text(self) -> str:
-        return self._latest_status
+        with self._state_lock:
+            pending_error = self._pending_error
+            has_pending = self._requested_prompt_id != self._applied_prompt_id
+            latest_status = self._latest_status
+        if pending_error is not None:
+            return pending_error
+        if has_pending:
+            return f"{latest_status} | tokenizing prompt update"
+        return latest_status
 
     def close(self) -> None:
+        with self._state_lock:
+            self._shutdown = True
+        self._tokenization_event.set()
+        if self._tokenization_thread is not None:
+            self._tokenization_thread.join(timeout=0.2)
         return None
 
 
@@ -1119,6 +1310,17 @@ def main() -> None:
                     _sync_magenta_prompt(state, magenta_controller)
             elif state.pose_status == "static rows":
                 state.pose_status = f"{pose_source.label} waiting"
+
+        if magenta_controller is not None and (args.preview_only or args.preview_dir):
+            try:
+                magenta_controller.flush_pending_updates()
+            except Exception as exc:
+                raise SystemExit(
+                    f"Could not finalize prompt recombiner state: {exc}"
+                ) from exc
+            state.current_style_tokens = list(magenta_controller.current_style_tokens)
+            state.current_prompt_text = magenta_controller.current_prompt_text
+            state.magenta_status = magenta_controller.status_text()
 
         frames = build_frames(
             canvas_sizes,
