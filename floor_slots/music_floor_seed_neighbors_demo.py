@@ -11,11 +11,13 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Empty, Full, Queue
 from typing import Any, Dict, Iterable, List, Tuple
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
+import httpx
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -266,8 +268,11 @@ class LucidPoseSource:
         self.poll_interval = max(0.001, poll_interval)
         self.base_url = self._build_base_url(endpoint, port)
         self.label = f"pose lucid {self.service_name} @ {self.base_url}"
-        self._last_sequence: int | None = None
-        self._next_poll_at = 0.0
+        self._last_frame_index: int | None = None
+        self._queue: Queue[Dict[str, Any]] = Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._finished_event = threading.Event()
+        self._stream_error: str | None = None
 
         info = self._request_json("/info")
         detected_service = str(info.get("service") or "").strip()
@@ -276,6 +281,12 @@ class LucidPoseSource:
                 f"Expected Lucid pose service {self.service_name!r}, "
                 f"but {self.base_url} reports {detected_service!r}."
             )
+        self._thread = threading.Thread(
+            target=self._stream_reader_main,
+            name="music-floor-seed-neighbors-lucid-stream",
+            daemon=True,
+        )
+        self._thread.start()
 
     @staticmethod
     def _build_base_url(endpoint: str, port: int) -> str:
@@ -326,49 +337,123 @@ class LucidPoseSource:
             raise RuntimeError(f"GET {path} returned {type(data).__name__}, expected object.")
         return data
 
-    def poll_latest(self):
-        now = time.monotonic()
-        if now < self._next_poll_at:
-            return None
-        self._next_poll_at = now + self.poll_interval
-
-        payload = self._request_json("/poses/latest")
-        message = payload.get("message")
-        sequence = payload.get("sequence")
+    @staticmethod
+    def _replace_latest_queue_item(
+        queue: Queue[Dict[str, Any]],
+        item: Dict[str, Any],
+    ) -> None:
         try:
-            sequence_value = int(sequence) if sequence is not None else None
-        except (TypeError, ValueError):
-            sequence_value = None
+            queue.put_nowait(item)
+            return
+        except Full:
+            pass
+        try:
+            while True:
+                queue.get_nowait()
+        except Empty:
+            pass
+        try:
+            queue.put_nowait(item)
+        except Full:
+            pass
 
+    def _stream_reader_main(self) -> None:
+        params = {"poll_interval": str(self.poll_interval)}
+        try:
+            with httpx.Client(base_url=self.base_url, timeout=None) as client:
+                with client.stream("GET", "/poses/stream", params=params) as response:
+                    response.raise_for_status()
+                    event_name = "message"
+                    for raw_line in response.iter_lines():
+                        if self._stop_event.is_set():
+                            break
+                        if not raw_line:
+                            event_name = "message"
+                            continue
+                        line = (
+                            raw_line
+                            if isinstance(raw_line, str)
+                            else raw_line.decode("utf-8", errors="replace")
+                        )
+                        if line.startswith(":"):
+                            continue
+                        if line.startswith("event:"):
+                            event_name = line.split(":", 1)[1].strip() or "message"
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if not payload:
+                            continue
+                        try:
+                            message = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(message, dict):
+                            continue
+                        if event_name == "error":
+                            self._stream_error = str(message.get("error") or "unknown pose stream error")
+                            self._replace_latest_queue_item(
+                                self._queue,
+                                {"error": self._stream_error},
+                            )
+                            continue
+                        self._replace_latest_queue_item(self._queue, message)
+        except Exception as exc:
+            self._stream_error = str(exc)
+            self._replace_latest_queue_item(self._queue, {"error": self._stream_error})
+        finally:
+            self._finished_event.set()
+
+    def poll_latest(self):
+        latest = None
+        while True:
+            try:
+                latest = self._queue.get_nowait()
+            except Empty:
+                break
+        if latest is None:
+            if self._finished_event.is_set() and self._stream_error is not None:
+                raise RuntimeError(f"pose stream failed: {self._stream_error}")
+            return None
+        if "error" in latest and len(latest) == 1:
+            raise RuntimeError(str(latest["error"]))
+        frame_index = latest.get("frame_index")
+        try:
+            frame_value = int(frame_index) if frame_index is not None else None
+        except (TypeError, ValueError):
+            frame_value = None
         if (
-            sequence_value is not None
-            and self._last_sequence is not None
-            and sequence_value <= self._last_sequence
+            frame_value is not None
+            and self._last_frame_index is not None
+            and frame_value <= self._last_frame_index
         ):
             return None
-        if sequence_value is not None:
-            self._last_sequence = sequence_value
-
-        if not isinstance(message, dict):
-            return None
-        return message
+        if frame_value is not None:
+            self._last_frame_index = frame_value
+        return latest
 
     def wait_for_latest(self, max_wait_seconds: float):
         deadline = time.monotonic() + max(0.0, max_wait_seconds)
         latest = self.poll_latest()
         while latest is None and time.monotonic() < deadline:
-            time.sleep(self.poll_interval)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._stop_event.wait(min(0.005, remaining))
             latest = self.poll_latest()
         return latest
 
     def close(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=0.2)
         return None
 
 
 class AsyncPoseSource:
     def __init__(
         self,
-        source: ZmqPoseStreamSource | LucidPoseSource,
+        source: ZmqPoseStreamSource,
         *,
         idle_sleep: float = 0.005,
     ) -> None:
@@ -432,7 +517,7 @@ class AsyncPoseSource:
         self._thread.join(timeout=self._join_timeout)
 
 
-PoseSource = AsyncPoseSource
+PoseSource = LucidPoseSource | AsyncPoseSource
 
 
 def _resolve_token_bank_path(path_text: str) -> Path:
@@ -1954,20 +2039,19 @@ def _connect_pose_source(args: argparse.Namespace) -> PoseSource | None:
         return None
     port = _resolve_pose_port(args.pose_protocol, args.pose_port)
     if args.pose_protocol == "lucid":
-        source = LucidPoseSource(
+        return LucidPoseSource(
             endpoint=args.pose_endpoint,
             port=port,
             timeout=args.pose_timeout,
             poll_interval=args.pose_poll_interval,
             service_name=args.pose_service,
         )
-    else:
-        source = ZmqPoseStreamSource(
-            endpoint=args.pose_endpoint,
-            port=port,
-            timeout=args.pose_timeout,
-            poll_interval=args.pose_poll_interval,
-        )
+    source = ZmqPoseStreamSource(
+        endpoint=args.pose_endpoint,
+        port=port,
+        timeout=args.pose_timeout,
+        poll_interval=args.pose_poll_interval,
+    )
     return AsyncPoseSource(source, idle_sleep=min(0.01, max(0.001, args.pose_poll_interval / 2.0)))
 
 
