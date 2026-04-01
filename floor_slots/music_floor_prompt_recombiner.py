@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render Music Floor with compositional techno prompt fields."""
+"""Render Music Floor with compositional prompt recombination."""
 
 from __future__ import annotations
 
@@ -20,20 +20,167 @@ if __package__ in (None, ""):
         sys.path.insert(0, repo_root_str)
 
 from floor_slots import music_floor_demo as base
-from floor_slots.music_floor_techno_slots import (
-    DEFAULT_TECHNO_PROMPT_ANCHOR,
-    DEFAULT_TECHNO_SCHEMA_NAME,
-    compose_techno_prompt,
-    field_choice_labels,
-    field_choice_prompts,
-    field_names,
-    format_techno_schema,
-    selected_choice_labels,
-)
 
 pygame = base.pygame
 
-SCHEMA_NAME = DEFAULT_TECHNO_SCHEMA_NAME
+PROMPT_FIELD_COUNT = 6
+PROMPT_OPTION_COUNT = 6
+DEFAULT_PROMPT_ANCHOR = "minimal techno"
+DEFAULT_PROMPT_SCHEMA_NAME = "prompt_recombiner_v1"
+
+
+@dataclass(frozen=True)
+class SlotChoice:
+    label: str
+    prompt: str
+
+
+@dataclass(frozen=True)
+class PromptField:
+    name: str
+    choices: Tuple[SlotChoice, ...]
+
+
+PROMPT_FIELDS: Tuple[PromptField, ...] = (
+    PromptField(
+        name="Beat",
+        choices=(
+            SlotChoice("Four Floor", "steady four on the floor"),
+            SlotChoice("Drive", "driving pulse"),
+            SlotChoice("Roll", "rolling syncopation"),
+            SlotChoice("Slow Burn", "slow-burning groove"),
+            SlotChoice("Low Slung", "low-slung groove"),
+            SlotChoice("Stomp", "straight warehouse stomp"),
+        ),
+    ),
+    PromptField(
+        name="Bass",
+        choices=(
+            SlotChoice("Sub Roll", "rolling sub bass"),
+            SlotChoice("Rubber", "rubbery bassline"),
+            SlotChoice("Acid", "subtle acid bass"),
+            SlotChoice("Mono Pulse", "pulsing mono bass"),
+            SlotChoice("Drone", "sub drone"),
+            SlotChoice("Hollow", "hollow low-end throb"),
+        ),
+    ),
+    PromptField(
+        name="Perc",
+        choices=(
+            SlotChoice("Clicks", "clicky percussion"),
+            SlotChoice("Hats", "shuffled hats"),
+            SlotChoice("Rim Ticks", "dry rim ticks"),
+            SlotChoice("Metallic", "metallic hat chatter"),
+            SlotChoice("Dub Echoes", "dubby percussion echoes"),
+            SlotChoice("Claps", "snappy clap accents"),
+        ),
+    ),
+    PromptField(
+        name="Texture",
+        choices=(
+            SlotChoice("Sequencer", "hypnotic sequencer"),
+            SlotChoice("Stab", "filtered synth stab"),
+            SlotChoice("Dub Chords", "muted dub chords"),
+            SlotChoice("Blips", "minimal synth blips"),
+            SlotChoice("Pad Smear", "detuned pad smear"),
+            SlotChoice("Acid Frags", "acid line fragments"),
+        ),
+    ),
+    PromptField(
+        name="Space",
+        choices=(
+            SlotChoice("Punchy", "tight punchy compression"),
+            SlotChoice("Hi-Fi", "clean hi-fi sheen"),
+            SlotChoice("Analog", "warm analog blur"),
+            SlotChoice("Reverb", "lush reverb tail"),
+            SlotChoice("Warehouse", "dry warehouse room"),
+            SlotChoice("Studio", "polished studio mix"),
+        ),
+    ),
+    PromptField(
+        name="Mood",
+        choices=(
+            SlotChoice("Hypnotic", "hypnotic, minor key tension"),
+            SlotChoice("Brooding", "brooding, open fifth drones"),
+            SlotChoice("Chromatic", "mysterious, chromatic movement"),
+            SlotChoice("Focused", "focused, modal restraint"),
+            SlotChoice("Suspended", "playful, suspended harmonies"),
+            SlotChoice("Pressure", "dark, low-register pressure"),
+        ),
+    ),
+)
+
+SCHEMA_NAME = DEFAULT_PROMPT_SCHEMA_NAME
+
+
+def _validated_rows(selected_rows: Sequence[int]) -> List[int]:
+    rows = [int(index) for index in selected_rows]
+    if len(rows) != PROMPT_FIELD_COUNT:
+        raise ValueError(
+            f"Expected {PROMPT_FIELD_COUNT} selected rows, got {len(rows)}."
+        )
+    for field_index, row_index in enumerate(rows):
+        if row_index < 0 or row_index >= PROMPT_OPTION_COUNT:
+            raise ValueError(
+                f"Field {field_index + 1} row must be between 0 and "
+                f"{PROMPT_OPTION_COUNT - 1}; got {row_index}."
+            )
+    return rows
+
+
+def field_names() -> List[str]:
+    return [field.name for field in PROMPT_FIELDS]
+
+
+def field_choice_labels() -> List[List[str]]:
+    return [[choice.label for choice in field.choices] for field in PROMPT_FIELDS]
+
+
+def field_choice_prompts() -> List[List[str]]:
+    return [[choice.prompt for choice in field.choices] for field in PROMPT_FIELDS]
+
+
+def selected_choice_labels(selected_rows: Sequence[int]) -> List[str]:
+    rows = _validated_rows(selected_rows)
+    return [
+        field.choices[row_index].label
+        for field, row_index in zip(PROMPT_FIELDS, rows)
+    ]
+
+
+def selected_choice_prompts(selected_rows: Sequence[int]) -> List[str]:
+    rows = _validated_rows(selected_rows)
+    return [
+        field.choices[row_index].prompt
+        for field, row_index in zip(PROMPT_FIELDS, rows)
+    ]
+
+
+def compose_prompt(
+    selected_rows: Sequence[int],
+    *,
+    anchor: str = DEFAULT_PROMPT_ANCHOR,
+) -> str:
+    normalized_anchor = " ".join((anchor or "").strip().split())
+    if not normalized_anchor:
+        raise ValueError("Prompt anchor cannot be empty.")
+    parts = [normalized_anchor, *selected_choice_prompts(selected_rows)]
+    return ", ".join(part for part in parts if part)
+
+
+def format_schema(
+    *,
+    anchor: str = DEFAULT_PROMPT_ANCHOR,
+) -> str:
+    lines = [
+        f"schema: {DEFAULT_PROMPT_SCHEMA_NAME}",
+        f"anchor: {anchor}",
+    ]
+    for field_index, field in enumerate(PROMPT_FIELDS, start=1):
+        lines.append(f"{field_index}. {field.name}")
+        for row_index, choice in enumerate(field.choices, start=1):
+            lines.append(f"   R{row_index}: {choice.label} :: {choice.prompt}")
+    return "\n".join(lines)
 
 
 @dataclass
@@ -52,7 +199,7 @@ class GridState:
     timestamp_iso: str | None = None
     pose_status: str = "static rows"
     prompt_schema_name: str = SCHEMA_NAME
-    prompt_anchor: str = DEFAULT_TECHNO_PROMPT_ANCHOR
+    prompt_anchor: str = DEFAULT_PROMPT_ANCHOR
     current_prompt_text: str = ""
     magenta_server_url: str = base.DEFAULT_MAGENTA_SERVER_URL
     magenta_status: str = "magenta idle"
@@ -61,7 +208,7 @@ class GridState:
     option_prompts_by_column: List[List[str]] = field(default_factory=field_choice_prompts)
 
 
-class TechnoPromptController:
+class PromptRecombinerController:
     def __init__(
         self,
         server_url: str,
@@ -219,7 +366,7 @@ class TechnoPromptController:
             payload = {
                 "style_tokens": tokens,
                 "style_text": prompt,
-                "style_source": "techno_slots",
+                "style_source": "prompt_recombiner",
             }
             path = "/reset_session" if reset_context else "/update_style_tokens"
             response = self._request_json(
@@ -274,7 +421,7 @@ class TechnoPromptController:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Music Floor demo with per-column techno prompt-field recomposition."
+        description="Music Floor demo with per-column prompt recombination."
     )
     parser.add_argument(
         "--config",
@@ -357,13 +504,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt-anchor",
         type=str,
-        default=DEFAULT_TECHNO_PROMPT_ANCHOR,
-        help="Fixed prefix prepended before the six selected techno fields.",
+        default=DEFAULT_PROMPT_ANCHOR,
+        help="Fixed prefix prepended before the six selected prompt fields.",
     )
     parser.add_argument(
-        "--list-techno-schema",
+        "--list-schema",
         action="store_true",
-        help="Print the compositional techno field schema and exit.",
+        help="Print the compositional prompt schema and exit.",
     )
     parser.add_argument(
         "--magenta-server-url",
@@ -434,7 +581,7 @@ def _selected_choice_prompts_for_state(state: GridState) -> List[str]:
 
 
 def _compose_state_prompt(state: GridState) -> str:
-    return compose_techno_prompt(state.selected_rows, anchor=state.prompt_anchor)
+    return compose_prompt(state.selected_rows, anchor=state.prompt_anchor)
 
 
 def create_floor_frame(size: base.Size, state: GridState) -> pygame.Surface:
@@ -543,9 +690,16 @@ def create_front_frame(
             reset_button_rect.left - left_pad - 24,
         )
 
-    base._render_text(surface, "Music Floor Techno Fields", title_font, base.TEXT_MAIN, left_pad, top_pad)
+    base._render_text(
+        surface,
+        "Music Floor Prompt Recombiner",
+        title_font,
+        base.TEXT_MAIN,
+        left_pad,
+        top_pad,
+    )
     subtitle_lines = _wrap_text(
-        "Each column picks one prompt field. The current six choices are recomposed into one techno prompt.",
+        "Each column picks one prompt field. The current six choices are recomposed into one prompt.",
         subtitle_font,
         header_max_width,
         max_lines=2,
@@ -843,10 +997,10 @@ def _connect_magenta_controller(
     prompt_text: str,
     *,
     start_playback: bool,
-) -> TechnoPromptController:
+) -> PromptRecombinerController:
     del start_playback
     try:
-        return TechnoPromptController(
+        return PromptRecombinerController(
             server_url=args.magenta_server_url,
             player_control_url=args.player_control_url,
             initial_prompt=prompt_text,
@@ -857,7 +1011,7 @@ def _connect_magenta_controller(
 
 def _sync_magenta_prompt(
     state: GridState,
-    magenta_controller: TechnoPromptController | None,
+    magenta_controller: PromptRecombinerController | None,
 ) -> bool:
     next_prompt = _compose_state_prompt(state)
     if next_prompt == state.current_prompt_text:
@@ -873,7 +1027,7 @@ def _sync_magenta_prompt(
 
 def _reset_magenta_context(
     state: GridState,
-    magenta_controller: TechnoPromptController | None,
+    magenta_controller: PromptRecombinerController | None,
 ) -> None:
     if magenta_controller is None:
         state.magenta_status = "context reset unavailable: no magenta controller"
@@ -913,8 +1067,8 @@ def _visual_state_signature(state: GridState) -> Tuple[object, ...]:
 
 def main() -> None:
     args = parse_args()
-    if args.list_techno_schema:
-        print(format_techno_schema(anchor=args.prompt_anchor))
+    if args.list_schema:
+        print(format_schema(anchor=args.prompt_anchor))
         return
 
     pygame.init()
@@ -995,11 +1149,11 @@ def main() -> None:
                 front_canvas=args.front_canvas,
             )
             emulate_window = pygame.display.set_mode(emulate_layout.window_size)
-            pygame.display.set_caption("music-floor-techno-slots emulate")
+            pygame.display.set_caption("music-floor-prompt-recombiner emulate")
         else:
             router = base.CanvasProjectorRouter.from_room_config(
                 args.config,
-                caption_prefix="music-floor-techno-slots: ",
+                caption_prefix="music-floor-prompt-recombiner: ",
                 auto_display=True,
                 renderer_kwargs={"use_sdl2_window": True},
             )

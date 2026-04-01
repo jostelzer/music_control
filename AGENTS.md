@@ -73,8 +73,8 @@ Good modifier phrases in this repo style include:
 - `python music_floor_player.py --prompt-file prompts.txt`
 - `python floor_slots/music_floor_demo.py --help`
 - `python floor_slots/music_floor_demo.py --preview-only --preview-dir .agents/preview_local`
-- `python floor_slots/music_floor_techno_slots_demo.py --list-techno-schema`
-- `python floor_slots/music_floor_techno_slots_demo.py --preview-only --preview-dir .agents/preview_techno_fields`
+- `python floor_slots/music_floor_prompt_recombiner.py --list-schema`
+- `python floor_slots/music_floor_prompt_recombiner.py --preview-only --preview-dir .agents/preview_prompt_recombiner`
 
 ## Editing Guidance
 
