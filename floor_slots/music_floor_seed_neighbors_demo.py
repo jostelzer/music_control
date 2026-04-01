@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -364,7 +365,74 @@ class LucidPoseSource:
         return None
 
 
-PoseSource = ZmqPoseStreamSource | LucidPoseSource
+class AsyncPoseSource:
+    def __init__(
+        self,
+        source: ZmqPoseStreamSource | LucidPoseSource,
+        *,
+        idle_sleep: float = 0.005,
+    ) -> None:
+        self._source = source
+        self.label = source.label
+        self._idle_sleep = max(0.001, float(idle_sleep))
+        self._state_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._pending_message = None
+        self._pending_error: RuntimeError | None = None
+        self._join_timeout = max(0.2, float(getattr(source, "timeout", 0.0)) + 0.2)
+        self._thread = threading.Thread(
+            target=self._worker_main,
+            name="music-floor-seed-neighbors-pose",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _worker_main(self) -> None:
+        # Keep pose I/O off the render thread so network jitter does not stall the UI.
+        while not self._stop_event.is_set():
+            try:
+                message = self._source.poll_latest()
+            except Exception as exc:
+                with self._state_lock:
+                    self._pending_error = RuntimeError(f"{self.label} polling failed: {exc}")
+                if self._stop_event.wait(self._idle_sleep):
+                    return
+                continue
+            if message is not None:
+                with self._state_lock:
+                    self._pending_message = message
+                    self._pending_error = None
+            elif self._stop_event.wait(self._idle_sleep):
+                return
+
+    def poll_latest(self):
+        with self._state_lock:
+            pending_error = self._pending_error
+            pending_message = self._pending_message
+            self._pending_error = None
+            self._pending_message = None
+        if pending_error is not None:
+            raise pending_error
+        return pending_message
+
+    def wait_for_latest(self, max_wait_seconds: float):
+        deadline = time.monotonic() + max(0.0, max_wait_seconds)
+        latest = self.poll_latest()
+        while latest is None and time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._stop_event.wait(min(self._idle_sleep, remaining))
+            latest = self.poll_latest()
+        return latest
+
+    def close(self) -> None:
+        self._stop_event.set()
+        self._source.close()
+        self._thread.join(timeout=self._join_timeout)
+
+
+PoseSource = AsyncPoseSource
 
 
 def _resolve_token_bank_path(path_text: str) -> Path:
@@ -1886,19 +1954,21 @@ def _connect_pose_source(args: argparse.Namespace) -> PoseSource | None:
         return None
     port = _resolve_pose_port(args.pose_protocol, args.pose_port)
     if args.pose_protocol == "lucid":
-        return LucidPoseSource(
+        source = LucidPoseSource(
             endpoint=args.pose_endpoint,
             port=port,
             timeout=args.pose_timeout,
             poll_interval=args.pose_poll_interval,
             service_name=args.pose_service,
         )
-    return ZmqPoseStreamSource(
-        endpoint=args.pose_endpoint,
-        port=port,
-        timeout=args.pose_timeout,
-        poll_interval=args.pose_poll_interval,
-    )
+    else:
+        source = ZmqPoseStreamSource(
+            endpoint=args.pose_endpoint,
+            port=port,
+            timeout=args.pose_timeout,
+            poll_interval=args.pose_poll_interval,
+        )
+    return AsyncPoseSource(source, idle_sleep=min(0.01, max(0.001, args.pose_poll_interval / 2.0)))
 
 
 def _apply_debug_people_if_any(state: GridState, args: argparse.Namespace) -> List[int]:
